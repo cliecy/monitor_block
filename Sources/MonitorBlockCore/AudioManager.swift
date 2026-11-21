@@ -405,6 +405,7 @@ public final class AudioManager {
     private let audioBackend: AudioBackend
     private let ddcBackend: DDCBackend
     private var cachedDDCVolumes: [Int: Int] = [:]
+    private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
 
     public init(
@@ -514,9 +515,16 @@ public final class AudioManager {
     @discardableResult
     public func setDDCVolume(_ percent: Int, endpointIndex: Int) -> Bool {
         let clamped = min(max(percent, 0), 100)
+        let wasMuted = cachedDDCMuted[endpointIndex] ?? false
         cachedDDCVolumes[endpointIndex] = clamped
+
         if clamped > 0 {
+            preMuteDDCVolumes[endpointIndex] = clamped
             cachedDDCMuted[endpointIndex] = false
+            if wasMuted {
+                // 清理可能残留的硬件静音状态（VCP 0x8D = 2）
+                _ = ddcBackend.setMuted(false, endpointIndex: endpointIndex)
+            }
         }
         return ddcBackend.setVolume(clamped, endpointIndex: endpointIndex)
     }
@@ -524,13 +532,24 @@ public final class AudioManager {
     @discardableResult
     public func setDDCMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
         cachedDDCMuted[endpointIndex] = muted
-        let muteOK = ddcBackend.setMuted(muted, endpointIndex: endpointIndex)
-        if !muteOK {
-            // 部分显示器（如部分 LG 型号）不支持 VCP 0x8D 静音码，自动回退为将音量设为 0 / 恢复原音量
-            let fallbackVolume = muted ? 0 : (cachedDDCVolumes[endpointIndex] ?? 50)
-            return ddcBackend.setVolume(fallbackVolume, endpointIndex: endpointIndex)
+        if muted {
+            // 记录静音前的非零音量；通过将 VCP 0x62 设为 0 实现 100% 可逆静音，避免 LG 等显示器收到 0x8D=1 后无法软件解除静音
+            let current = cachedDDCVolumes[endpointIndex]
+                ?? ddcBackend.readVolume(endpointIndex: endpointIndex)
+                ?? 50
+            if current > 0 {
+                preMuteDDCVolumes[endpointIndex] = current
+            }
+            cachedDDCVolumes[endpointIndex] = 0
+            return ddcBackend.setVolume(0, endpointIndex: endpointIndex)
+        } else {
+            // 先补发一次 VCP 0x8D = 2 尝试清理可能已存在的硬件静音锁，再通过 VCP 0x62 恢复静音前音量
+            _ = ddcBackend.setMuted(false, endpointIndex: endpointIndex)
+            let cached = cachedDDCVolumes[endpointIndex] ?? 0
+            let restoreVolume = preMuteDDCVolumes[endpointIndex] ?? (cached > 0 ? cached : 50)
+            cachedDDCVolumes[endpointIndex] = restoreVolume
+            return ddcBackend.setVolume(restoreVolume, endpointIndex: endpointIndex)
         }
-        return true
     }
 
     public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {

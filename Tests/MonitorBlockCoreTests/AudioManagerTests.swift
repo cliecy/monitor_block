@@ -134,8 +134,8 @@ struct AudioManagerTests {
         #expect(ddc.setVolumeCalls.last?.volume == 32)
     }
 
-    @Test("外接屏不支持 DDC VCP 0x8D 静音码时自动回退为将音量设为 0 与恢复原音量")
-    func ddcMuteFallsBackToZeroVolumeWhenVCP8DUnsupported() {
+    @Test("DDC 静音通过归零 VCP 0x62 实现可逆静音，解除静音时补发 0x8D=2 并恢复原音量")
+    func ddcMuteAndUnmuteRestoresPreviousVolumeSafely() {
         let audio = MockAudioBackend()
         audio.devices = [
             AudioOutputDevice(id: 30, uid: "lg-hdmi", name: "LG UltraFine", transport: .hdmi, isDefault: true, supportsCoreAudioVolume: false)
@@ -144,15 +144,24 @@ struct AudioManagerTests {
         let ddc = MockDDCBackend()
         ddc.endpoints = [DDCDisplayEndpoint(index: 0, name: "LG UltraFine")]
         ddc.hardwareVolumes = [0: 55]
-        ddc.muteSupported = false
 
         let manager = AudioManager(audioBackend: audio, ddcBackend: ddc)
         _ = manager.currentVolumeSnapshot(readHardwareDDC: true)
 
+        // 静音：不发 0x8D=1（避免锁死 LG 固件），直接将 VCP 0x62 置 0
         #expect(manager.setCurrentMuted(true) == true)
+        #expect(ddc.setMuteCalls.isEmpty)
         #expect(ddc.setVolumeCalls.last?.volume == 0)
 
+        // 解除静音：先发 0x8D=2 清理可能的硬件静音锁，再恢复到 55
         #expect(manager.setCurrentMuted(false) == true)
+        #expect(ddc.setMuteCalls.last?.muted == false)
         #expect(ddc.setVolumeCalls.last?.volume == 55)
+
+        // 再次静音后直接拖动滑块调高音量，也应先发 0x8D=2 再写目标音量
+        #expect(manager.setCurrentMuted(true) == true)
+        #expect(manager.setCurrentVolume(0.42) == true)
+        #expect(ddc.setMuteCalls.last?.muted == false)
+        #expect(ddc.setVolumeCalls.last?.volume == 42)
     }
 }

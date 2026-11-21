@@ -182,6 +182,12 @@ final class MenuBarPopoverViewModel: ObservableObject {
         let nextMuted = !isMuted
         isMuted = nextMuted
         _ = audioManager.setCurrentMuted(nextMuted)
+        let snap = audioManager.currentVolumeSnapshot(readHardwareDDC: false)
+        volume = snap.volume
+        isMuted = snap.isMuted
+        if case .ddc(let idx, _) = snap.mode {
+            ddcVolumes[idx] = snap.volume
+        }
     }
 
     func updateDDCVolume(endpointIndex: Int, value: Double) {
