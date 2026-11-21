@@ -1,0 +1,56 @@
+name: Build & Release MonitorBlock
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build macOS App (Apple Silicon)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Run unit tests
+        run: swift test
+
+      - name: Build and bundle MonitorBlock.app
+        run: |
+          chmod +x scripts/bundle_app.sh
+          ./scripts/bundle_app.sh
+
+      - name: Package zip archive
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent build/MonitorBlock.app build/MonitorBlock-macos-arm64.zip
+          shasum -a 256 build/MonitorBlock-macos-arm64.zip > build/MonitorBlock-macos-arm64.zip.sha256
+          ls -lh build/MonitorBlock-macos-arm64.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonitorBlock-macos-arm64
+          path: |
+            build/MonitorBlock-macos-arm64.zip
+            build/MonitorBlock-macos-arm64.zip.sha256
+
+      - name: Create GitHub Release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            build/MonitorBlock-macos-arm64.zip \
+            build/MonitorBlock-macos-arm64.zip.sha256 \
+            --title "MonitorBlock $TAG" \
+            --notes "Apple Silicon macOS 菜单栏工具 MonitorBlock $TAG。下载解压后将 MonitorBlock.app 拖入 /Applications 即可使用（首次打开如提示未知开发者，右键点击打开或在系统设置 -> 隐私与安全性中允许）。"
