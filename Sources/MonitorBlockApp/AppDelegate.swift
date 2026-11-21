@@ -2,15 +2,19 @@ import AppKit
 import CoreGraphics
 import Foundation
 import MonitorBlockCore
+import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private static let autoRestoreKey = "MonitorBlock.autoRestoreOnQuit"
 
-    private let manager = DisplayManager()
+    private let displayManager = DisplayManager()
+    private let audioManager = AudioManager()
     private let launchAtLogin = LaunchAtLoginManager()
+
     private var statusItem: NSStatusItem!
-    private let menu = NSMenu()
+    private let popover = NSPopover()
+    private var popoverViewModel: MenuBarPopoverViewModel!
     private var layoutEditorController: LayoutEditorWindowController?
     private var wakeObserver: NSObjectProtocol?
     private var pendingRefreshWorkItem: DispatchWorkItem?
@@ -31,14 +35,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        menu.delegate = self
-        statusItem.menu = menu
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
 
-        refreshUI()
+        popoverViewModel = MenuBarPopoverViewModel(
+            displayManager: displayManager,
+            audioManager: audioManager,
+            launchAtLogin: launchAtLogin,
+            autoRestoreOnQuit: autoRestoreOnQuit,
+            onOpenLayoutEditor: { [weak self] in
+                self?.popover.performClose(nil)
+                self?.openLayoutEditor()
+            },
+            onPromptSavePreset: { [weak self] in
+                self?.popover.performClose(nil)
+                self?.promptSaveCurrentPreset()
+            },
+            onToggleAutoRestore: { [weak self] in
+                guard let self else { return }
+                self.autoRestoreOnQuit.toggle()
+                self.popoverViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+            },
+            onQuit: {
+                NSApp.terminate(nil)
+            },
+            onStatusChanged: { [weak self] in
+                self?.updateStatusIcon()
+            }
+        )
 
-        manager.startObservingReconfiguration { [weak self] in
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(
+            rootView: MenuBarPopoverView(viewModel: popoverViewModel)
+        )
+
+        updateStatusIcon()
+
+        displayManager.startObservingReconfiguration { [weak self] in
             Task { @MainActor in
                 self?.scheduleRefresh(checkSafetyFallback: true)
+            }
+        }
+
+        audioManager.startObservingChanges { [weak self] in
+            Task { @MainActor in
+                self?.scheduleRefresh(delay: 0.15, checkSafetyFallback: false)
             }
         }
 
@@ -54,44 +100,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        manager.stopObservingReconfiguration()
+        displayManager.stopObservingReconfiguration()
+        audioManager.stopObservingChanges()
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
         if autoRestoreOnQuit {
-            _ = try? manager.enableAllDisplays()
+            _ = try? displayManager.enableAllDisplays()
         }
     }
 
-    // MARK: - NSMenuDelegate
+    // MARK: - Popover Toggle
 
-    func menuWillOpen(_ menu: NSMenu) {
-        refreshUI()
+    @objc private func togglePopover(_ sender: AnyObject?) {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popoverViewModel.refresh(readHardwareDDC: true, autoRestoreValue: autoRestoreOnQuit)
+            updateStatusIcon()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
-    // MARK: - UI Refresh
+    // MARK: - Refresh
 
     private func scheduleRefresh(delay: TimeInterval = 0.25, checkSafetyFallback: Bool = false) {
         pendingRefreshWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if checkSafetyFallback {
-                self.manager.ensureBuiltinActiveIfNoExternalActive()
+                self.displayManager.ensureBuiltinActiveIfNoExternalActive()
             }
-            self.refreshUI()
+            self.updateStatusIcon()
+            if self.popover.isShown {
+                self.popoverViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+            }
         }
         pendingRefreshWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
-    private func refreshUI() {
-        let allDisplays = manager.listDisplays(includeBuiltin: true)
-        updateStatusIcon(displays: allDisplays)
-        rebuildMenu(displays: allDisplays)
-    }
-
-    private func updateStatusIcon(displays: [DisplayInfo]) {
+    private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
+        let displays = displayManager.listDisplays(includeBuiltin: true)
         let externals = displays.filter { !$0.isBuiltin }
         let activeCount = displays.filter(\.isActive).count
 
@@ -118,199 +171,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.toolTip = tooltip
     }
 
-    private func rebuildMenu(displays: [DisplayInfo]) {
-        menu.removeAllItems()
+    // MARK: - Secondary Windows & Prompts
 
-        if !manager.isPrivateAPIAvailable {
-            let warning = NSMenuItem(
-                title: "⚠️ 当前系统不支持软断开 API",
-                action: nil,
-                keyEquivalent: ""
-            )
-            warning.isEnabled = false
-            menu.addItem(warning)
-            menu.addItem(.separator())
-        }
-
-        let header = NSMenuItem(title: "显示器开关（点击启用/停用）", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-
-        if displays.isEmpty {
-            let emptyItem = NSMenuItem(title: "  未检测到显示器", action: nil, keyEquivalent: "")
-            emptyItem.isEnabled = false
-            menu.addItem(emptyItem)
-        } else {
-            for display in displays {
-                var title = display.name
-                if display.isBuiltin {
-                    title += " [内置]"
-                }
-                if let res = display.resolutionText {
-                    title += "  (\(res))"
-                }
-                if !display.isActive {
-                    title += " [已停用]"
-                } else if display.isMain {
-                    title += " ★"
-                }
-                if manager.disableRule(forDisplayUUID: display.uuid) != nil {
-                    title += " • 已配关闭规则"
-                }
-
-                let item = NSMenuItem(
-                    title: title,
-                    action: #selector(toggleSingleDisplay(_:)),
-                    keyEquivalent: ""
-                )
-                item.target = self
-                item.state = display.isActive ? .on : .off
-                item.representedObject = NSNumber(value: display.id)
-                menu.addItem(item)
+    private func openLayoutEditor() {
+        if layoutEditorController == nil {
+            layoutEditorController = LayoutEditorWindowController(manager: displayManager) { [weak self] in
+                self?.scheduleRefresh(delay: 0.2, checkSafetyFallback: false)
             }
         }
-
-        menu.addItem(.separator())
-
-        let identifyItem = NSMenuItem(
-            title: "识别显示器（屏幕闪显名称）",
-            action: #selector(identifyAllDisplays),
-            keyEquivalent: "i"
-        )
-        identifyItem.target = self
-        menu.addItem(identifyItem)
-
-        // 布局预设子菜单
-        let presetsMenu = NSMenu()
-        let presets = manager.listPresets()
-        if presets.isEmpty {
-            let noneItem = NSMenuItem(title: "暂无已保存的预设", action: nil, keyEquivalent: "")
-            noneItem.isEnabled = false
-            presetsMenu.addItem(noneItem)
-        } else {
-            for preset in presets {
-                let presetItem = NSMenuItem(
-                    title: preset.name,
-                    action: #selector(applyPresetMenuItem(_:)),
-                    keyEquivalent: ""
-                )
-                presetItem.target = self
-                presetItem.representedObject = preset.id.uuidString
-                presetsMenu.addItem(presetItem)
-            }
-        }
-        presetsMenu.addItem(.separator())
-        let saveCurrentItem = NSMenuItem(
-            title: "保存当前布局为预设…",
-            action: #selector(promptSaveCurrentPreset),
-            keyEquivalent: ""
-        )
-        saveCurrentItem.target = self
-        presetsMenu.addItem(saveCurrentItem)
-
-        let presetsParent = NSMenuItem(title: "切换布局预设", action: nil, keyEquivalent: "")
-        presetsParent.submenu = presetsMenu
-        menu.addItem(presetsParent)
-
-        let openEditorItem = NSMenuItem(
-            title: "命名、布局与关闭规则设置…",
-            action: #selector(openLayoutEditor),
-            keyEquivalent: ","
-        )
-        openEditorItem.target = self
-        menu.addItem(openEditorItem)
-
-        menu.addItem(.separator())
-
-        let externals = displays.filter { !$0.isBuiltin }
-        let hasActiveExternal = externals.contains(where: \.isActive)
-        let hasAnyDisabled = displays.contains { !$0.isActive || $0.disabledByApp }
-
-        let disableAllExtItem = NSMenuItem(
-            title: "停用全部外接显示器",
-            action: #selector(disableAllExternalDisplays),
-            keyEquivalent: ""
-        )
-        disableAllExtItem.target = self
-        disableAllExtItem.isEnabled = hasActiveExternal
-        menu.addItem(disableAllExtItem)
-
-        let enableAllItem = NSMenuItem(
-            title: "恢复全部已停用显示器",
-            action: #selector(enableAllDisplays),
-            keyEquivalent: ""
-        )
-        enableAllItem.target = self
-        enableAllItem.isEnabled = hasAnyDisabled
-        menu.addItem(enableAllItem)
-
-        let refreshItem = NSMenuItem(
-            title: "刷新显示器列表",
-            action: #selector(manualRefresh),
-            keyEquivalent: "r"
-        )
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-
-        menu.addItem(.separator())
-
-        let launchAtLoginItem = NSMenuItem(
-            title: "开机自动启动",
-            action: #selector(toggleLaunchAtLogin),
-            keyEquivalent: ""
-        )
-        launchAtLoginItem.target = self
-        launchAtLoginItem.state = launchAtLogin.isEnabled ? .on : .off
-        menu.addItem(launchAtLoginItem)
-
-        let autoRestoreItem = NSMenuItem(
-            title: "退出时自动恢复所有已停用显示器",
-            action: #selector(toggleAutoRestore),
-            keyEquivalent: ""
-        )
-        autoRestoreItem.target = self
-        autoRestoreItem.state = autoRestoreOnQuit ? .on : .off
-        menu.addItem(autoRestoreItem)
-
-        let quitItem = NSMenuItem(
-            title: "退出 MonitorBlock",
-            action: #selector(quitApp),
-            keyEquivalent: "q"
-        )
-        quitItem.target = self
-        menu.addItem(quitItem)
+        layoutEditorController?.showAndRefresh()
     }
 
-    // MARK: - Actions
-
-    @objc private func toggleSingleDisplay(_ sender: NSMenuItem) {
-        guard let number = sender.representedObject as? NSNumber else { return }
-        let displayID = CGDirectDisplayID(number.uint32Value)
-        do {
-            try manager.toggleDisplay(id: displayID)
-            scheduleRefresh(delay: 0.25)
-        } catch {
-            showError(error)
-        }
-    }
-
-    @objc private func identifyAllDisplays() {
-        let displays = manager.listDisplays(includeBuiltin: true)
-        DisplayIdentifierOverlay.shared.identify(displays: displays)
-    }
-
-    @objc private func applyPresetMenuItem(_ sender: NSMenuItem) {
-        guard let uuidString = sender.representedObject as? String,
-              let presetID = UUID(uuidString: uuidString) else { return }
-        do {
-            try manager.applyPreset(id: presetID)
-            scheduleRefresh(delay: 0.25)
-        } catch {
-            showError(error)
-        }
-    }
-
-    @objc private func promptSaveCurrentPreset() {
+    private func promptSaveCurrentPreset() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "保存当前显示器布局"
@@ -323,68 +195,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = input
 
         if alert.runModal() == .alertFirstButtonReturn {
-            manager.savePreset(name: input.stringValue)
-            refreshUI()
+            displayManager.savePreset(name: input.stringValue)
+            popoverViewModel.refresh(readHardwareDDC: false)
         }
-    }
-
-    @objc private func openLayoutEditor() {
-        if layoutEditorController == nil {
-            layoutEditorController = LayoutEditorWindowController(manager: manager) { [weak self] in
-                self?.scheduleRefresh(delay: 0.2)
-            }
-        }
-        layoutEditorController?.showAndRefresh()
-    }
-
-    @objc private func disableAllExternalDisplays() {
-        do {
-            try manager.disableAllExternal()
-            scheduleRefresh(delay: 0.25)
-        } catch {
-            showError(error)
-        }
-    }
-
-    @objc private func enableAllDisplays() {
-        do {
-            try manager.enableAllDisplays()
-            scheduleRefresh(delay: 0.25)
-        } catch {
-            showError(error)
-        }
-    }
-
-    @objc private func manualRefresh() {
-        refreshUI()
-    }
-
-    @objc private func toggleLaunchAtLogin() {
-        do {
-            try launchAtLogin.setEnabled(!launchAtLogin.isEnabled)
-            refreshUI()
-        } catch {
-            showError(error)
-        }
-    }
-
-    @objc private func toggleAutoRestore() {
-        autoRestoreOnQuit.toggle()
-        refreshUI()
-    }
-
-    @objc private func quitApp() {
-        NSApp.terminate(nil)
-    }
-
-    private func showError(_ error: Error) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "操作未能完成"
-        alert.informativeText = error.localizedDescription
-        alert.addButton(withTitle: "好")
-        alert.runModal()
-        refreshUI()
     }
 }

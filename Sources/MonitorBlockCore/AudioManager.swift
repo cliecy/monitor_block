@@ -1,0 +1,570 @@
+import AudioToolbox
+import CoreAudio
+import Foundation
+
+public protocol AudioBackend: AnyObject {
+    func listOutputDevices() -> [AudioOutputDevice]
+    func defaultOutputDeviceID() -> UInt32?
+    func setDefaultOutputDevice(id: UInt32) -> Bool
+    func readCoreAudioVolume(deviceID: UInt32) -> Double?
+    func setCoreAudioVolume(_ volume: Double, deviceID: UInt32) -> Bool
+    func readCoreAudioMuted(deviceID: UInt32) -> Bool?
+    func setCoreAudioMuted(_ muted: Bool, deviceID: UInt32) -> Bool
+    func startObservingChanges(_ handler: @escaping @Sendable () -> Void)
+    func stopObservingChanges()
+}
+
+public final class CoreAudioBackend: AudioBackend {
+    private let listenerQueue = DispatchQueue(label: "local.cliecy.MonitorBlock.CoreAudioListener")
+    private var devicesListenerBlock: AudioObjectPropertyListenerBlock?
+    private var defaultOutputListenerBlock: AudioObjectPropertyListenerBlock?
+
+    public init() {}
+
+    deinit {
+        stopObservingChanges()
+    }
+
+    public func listOutputDevices() -> [AudioOutputDevice] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        var dataSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize
+        ) == noErr, dataSize > 0 else {
+            return []
+        }
+
+        let count = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &deviceIDs
+        ) == noErr else {
+            return []
+        }
+
+        let defaultID = defaultOutputDeviceID()
+
+        return deviceIDs.compactMap { deviceID -> AudioOutputDevice? in
+            guard hasOutputStreams(deviceID: deviceID) else { return nil }
+            let name = stringProperty(deviceID: deviceID, selector: kAudioDevicePropertyDeviceNameCFString)
+                ?? "音频设备 #\(deviceID)"
+            let uid = stringProperty(deviceID: deviceID, selector: kAudioDevicePropertyDeviceUID)
+                ?? "audio-\(deviceID)"
+            let transport = transportType(deviceID: deviceID)
+            let supportsVolume = supportsCoreAudioVolumeControl(deviceID: deviceID)
+
+            return AudioOutputDevice(
+                id: deviceID,
+                uid: uid,
+                name: name,
+                transport: transport,
+                isDefault: deviceID == defaultID,
+                supportsCoreAudioVolume: supportsVolume
+            )
+        }
+    }
+
+    public func defaultOutputDeviceID() -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var deviceID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            0,
+            nil,
+            &size,
+            &deviceID
+        )
+        guard status == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        return deviceID
+    }
+
+    public func setDefaultOutputDevice(id: UInt32) -> Bool {
+        var deviceID = AudioDeviceID(id)
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+
+        var outputAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &outputAddress,
+            0,
+            nil,
+            size,
+            &deviceID
+        )
+
+        // 同步切换系统提示音输出（如果允许）
+        var systemAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        _ = AudioObjectSetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &systemAddress,
+            0,
+            nil,
+            size,
+            &deviceID
+        )
+
+        return status == noErr
+    }
+
+    public func readCoreAudioVolume(deviceID: UInt32) -> Double? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioObjectHasProperty(deviceID, &address) {
+            var volume: Float32 = 0
+            var size = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &volume) == noErr {
+                return Double(volume)
+            }
+        }
+
+        // 回退到主通道或声道 1
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
+            var scalarAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(deviceID, &scalarAddr) {
+                var volume: Float32 = 0
+                var size = UInt32(MemoryLayout<Float32>.size)
+                if AudioObjectGetPropertyData(deviceID, &scalarAddr, 0, nil, &size, &volume) == noErr {
+                    return Double(volume)
+                }
+            }
+        }
+        return nil
+    }
+
+    public func setCoreAudioVolume(_ volume: Double, deviceID: UInt32) -> Bool {
+        var clamped = Float32(min(max(volume, 0.0), 1.0))
+        let size = UInt32(MemoryLayout<Float32>.size)
+
+        var virtualAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioObjectHasProperty(deviceID, &virtualAddr), isPropertySettable(deviceID: deviceID, address: &virtualAddr) {
+            if AudioObjectSetPropertyData(deviceID, &virtualAddr, 0, nil, size, &clamped) == noErr {
+                return true
+            }
+        }
+
+        var succeeded = false
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var scalarAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(deviceID, &scalarAddr), isPropertySettable(deviceID: deviceID, address: &scalarAddr) {
+                if AudioObjectSetPropertyData(deviceID, &scalarAddr, 0, nil, size, &clamped) == noErr {
+                    succeeded = true
+                }
+            }
+        }
+        return succeeded
+    }
+
+    public func readCoreAudioMuted(deviceID: UInt32) -> Bool? {
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(deviceID, &address) {
+                var muted: UInt32 = 0
+                var size = UInt32(MemoryLayout<UInt32>.size)
+                if AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &muted) == noErr {
+                    return muted != 0
+                }
+            }
+        }
+        return nil
+    }
+
+    public func setCoreAudioMuted(_ muted: Bool, deviceID: UInt32) -> Bool {
+        var value: UInt32 = muted ? 1 : 0
+        let size = UInt32(MemoryLayout<UInt32>.size)
+        var succeeded = false
+
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1, 2] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyMute,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(deviceID, &address), isPropertySettable(deviceID: deviceID, address: &address) {
+                if AudioObjectSetPropertyData(deviceID, &address, 0, nil, size, &value) == noErr {
+                    succeeded = true
+                }
+            }
+        }
+        return succeeded
+    }
+
+    public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {
+        stopObservingChanges()
+
+        let devicesBlock: AudioObjectPropertyListenerBlock = { _, _ in
+            handler()
+        }
+        let defaultBlock: AudioObjectPropertyListenerBlock = { _, _ in
+            handler()
+        }
+
+        var devicesAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var defaultAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &devicesAddr,
+            listenerQueue,
+            devicesBlock
+        )
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultAddr,
+            listenerQueue,
+            defaultBlock
+        )
+
+        devicesListenerBlock = devicesBlock
+        defaultOutputListenerBlock = defaultBlock
+    }
+
+    public func stopObservingChanges() {
+        if let block = devicesListenerBlock {
+            var devicesAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDevices,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &devicesAddr,
+                listenerQueue,
+                block
+            )
+            devicesListenerBlock = nil
+        }
+        if let block = defaultOutputListenerBlock {
+            var defaultAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &defaultAddr,
+                listenerQueue,
+                block
+            )
+            defaultOutputListenerBlock = nil
+        }
+    }
+
+    // MARK: - Private CoreAudio Helpers
+
+    private func hasOutputStreams(deviceID: AudioDeviceID) -> Bool {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size) == noErr, size > 0 else {
+            return false
+        }
+
+        let rawPtr = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawPtr.deallocate() }
+
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, rawPtr) == noErr else {
+            return false
+        }
+
+        let bufferList = UnsafeMutableAudioBufferListPointer(rawPtr.assumingMemoryBound(to: AudioBufferList.self))
+        return bufferList.contains { $0.mNumberChannels > 0 }
+    }
+
+    private func supportsCoreAudioVolumeControl(deviceID: AudioDeviceID) -> Bool {
+        var virtualAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        if AudioObjectHasProperty(deviceID, &virtualAddr), isPropertySettable(deviceID: deviceID, address: &virtualAddr) {
+            return true
+        }
+        for element: UInt32 in [kAudioObjectPropertyElementMain, 1] {
+            var scalarAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element
+            )
+            if AudioObjectHasProperty(deviceID, &scalarAddr), isPropertySettable(deviceID: deviceID, address: &scalarAddr) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func isPropertySettable(deviceID: AudioDeviceID, address: inout AudioObjectPropertyAddress) -> Bool {
+        var settable: DarwinBoolean = false
+        guard AudioObjectIsPropertySettable(deviceID, &address, &settable) == noErr else {
+            return false
+        }
+        return settable.boolValue
+    }
+
+    private func stringProperty(deviceID: AudioDeviceID, selector: AudioObjectPropertySelector) -> String? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr,
+              let str = value?.takeRetainedValue() as String? else {
+            return nil
+        }
+        return str
+    }
+
+    private func transportType(deviceID: AudioDeviceID) -> AudioTransportType {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
+            return .other
+        }
+        switch transport {
+        case kAudioDeviceTransportTypeBuiltIn: return .builtIn
+        case kAudioDeviceTransportTypeHDMI: return .hdmi
+        case kAudioDeviceTransportTypeDisplayPort: return .displayPort
+        case kAudioDeviceTransportTypeUSB: return .usb
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return .bluetooth
+        case kAudioDeviceTransportTypeAirPlay: return .airPlay
+        case kAudioDeviceTransportTypeVirtual: return .virtual
+        default: return .other
+        }
+    }
+}
+
+/// 统一管理音频输出切换、CoreAudio 音量与外接显示器 DDC/CI 硬件音量
+public final class AudioManager {
+    private let audioBackend: AudioBackend
+    private let ddcBackend: DDCBackend
+    private var cachedDDCVolumes: [Int: Int] = [:]
+    private var cachedDDCMuted: [Int: Bool] = [:]
+
+    public init(
+        audioBackend: AudioBackend = CoreAudioBackend(),
+        ddcBackend: DDCBackend = AppleSiliconDDCBackend()
+    ) {
+        self.audioBackend = audioBackend
+        self.ddcBackend = ddcBackend
+    }
+
+    public func listOutputDevices() -> [AudioOutputDevice] {
+        audioBackend.listOutputDevices()
+    }
+
+    public func listDDCEndpoints() -> [DDCDisplayEndpoint] {
+        ddcBackend.listEndpoints().map { endpoint in
+            let cachedVol = cachedDDCVolumes[endpoint.index]
+            let cachedMute = cachedDDCMuted[endpoint.index] ?? false
+            return DDCDisplayEndpoint(
+                index: endpoint.index,
+                name: endpoint.name,
+                currentVolume: cachedVol,
+                isMuted: cachedMute
+            )
+        }
+    }
+
+    @discardableResult
+    public func selectOutputDevice(id: UInt32) -> Bool {
+        audioBackend.setDefaultOutputDevice(id: id)
+    }
+
+    /// 读取当前默认输出设备的音量快照（若为不支持系统音量的外接屏，自动桥接 DDC/CI）
+    public func currentVolumeSnapshot(readHardwareDDC: Bool = false) -> AudioVolumeSnapshot {
+        let devices = audioBackend.listOutputDevices()
+        guard let active = devices.first(where: \.isDefault) ?? devices.first else {
+            return AudioVolumeSnapshot(deviceID: nil, volume: 0, isMuted: false, mode: .unsupported)
+        }
+
+        if active.supportsCoreAudioVolume {
+            let vol = audioBackend.readCoreAudioVolume(deviceID: active.id) ?? 0.5
+            let muted = audioBackend.readCoreAudioMuted(deviceID: active.id) ?? false
+            return AudioVolumeSnapshot(deviceID: active.id, volume: vol, isMuted: muted, mode: .coreAudio)
+        }
+
+        if let endpoint = matchDDCEndpoint(for: active) {
+            let level: Int
+            if let cached = cachedDDCVolumes[endpoint.index] {
+                level = cached
+            } else if readHardwareDDC, let hw = ddcBackend.readVolume(endpointIndex: endpoint.index) {
+                cachedDDCVolumes[endpoint.index] = hw
+                level = hw
+            } else {
+                level = 50
+            }
+            let muted = cachedDDCMuted[endpoint.index] ?? false
+            return AudioVolumeSnapshot(
+                deviceID: active.id,
+                volume: Double(level) / 100.0,
+                isMuted: muted,
+                mode: .ddc(ddcIndex: endpoint.index, displayName: endpoint.name)
+            )
+        }
+
+        return AudioVolumeSnapshot(deviceID: active.id, volume: 0, isMuted: false, mode: .unsupported)
+    }
+
+    @discardableResult
+    public func setCurrentVolume(_ volume: Double) -> Bool {
+        let clamped = min(max(volume, 0.0), 1.0)
+        let snapshot = currentVolumeSnapshot(readHardwareDDC: false)
+
+        switch snapshot.mode {
+        case .coreAudio:
+            guard let deviceID = snapshot.deviceID else { return false }
+            if clamped > 0.001, snapshot.isMuted {
+                _ = audioBackend.setCoreAudioMuted(false, deviceID: deviceID)
+            }
+            return audioBackend.setCoreAudioVolume(clamped, deviceID: deviceID)
+
+        case .ddc(let ddcIndex, _):
+            let percent = Int((clamped * 100.0).rounded())
+            return setDDCVolume(percent, endpointIndex: ddcIndex)
+
+        case .unsupported:
+            return false
+        }
+    }
+
+    @discardableResult
+    public func setCurrentMuted(_ muted: Bool) -> Bool {
+        let snapshot = currentVolumeSnapshot(readHardwareDDC: false)
+
+        switch snapshot.mode {
+        case .coreAudio:
+            guard let deviceID = snapshot.deviceID else { return false }
+            return audioBackend.setCoreAudioMuted(muted, deviceID: deviceID)
+
+        case .ddc(let ddcIndex, _):
+            return setDDCMuted(muted, endpointIndex: ddcIndex)
+
+        case .unsupported:
+            return false
+        }
+    }
+
+    @discardableResult
+    public func setDDCVolume(_ percent: Int, endpointIndex: Int) -> Bool {
+        let clamped = min(max(percent, 0), 100)
+        cachedDDCVolumes[endpointIndex] = clamped
+        if clamped > 0 {
+            cachedDDCMuted[endpointIndex] = false
+        }
+        return ddcBackend.setVolume(clamped, endpointIndex: endpointIndex)
+    }
+
+    @discardableResult
+    public func setDDCMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
+        cachedDDCMuted[endpointIndex] = muted
+        let muteOK = ddcBackend.setMuted(muted, endpointIndex: endpointIndex)
+        if !muteOK {
+            // 部分显示器（如部分 LG 型号）不支持 VCP 0x8D 静音码，自动回退为将音量设为 0 / 恢复原音量
+            let fallbackVolume = muted ? 0 : (cachedDDCVolumes[endpointIndex] ?? 50)
+            return ddcBackend.setVolume(fallbackVolume, endpointIndex: endpointIndex)
+        }
+        return true
+    }
+
+    public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {
+        audioBackend.startObservingChanges(handler)
+    }
+
+    public func stopObservingChanges() {
+        audioBackend.stopObservingChanges()
+    }
+
+    private func matchDDCEndpoint(for device: AudioOutputDevice) -> DDCDisplayEndpoint? {
+        guard ddcBackend.isAvailable else { return nil }
+        let endpoints = ddcBackend.listEndpoints()
+        guard !endpoints.isEmpty else { return nil }
+
+        // 1. 优先按名称包含匹配（如 "LG HDR 4K" / "DELL U2723QE"）
+        let loweredDevice = device.name.lowercased()
+        if let exact = endpoints.first(where: {
+            let epName = $0.name.lowercased()
+            return loweredDevice.contains(epName) || epName.contains(loweredDevice)
+        }) {
+            return exact
+        }
+
+        // 2. 如果是 HDMI / DisplayPort 输出设备，按外接音频设备顺序映射
+        if device.transport.isExternalDisplayAudio {
+            let externalAudioDevices = audioBackend.listOutputDevices().filter { $0.transport.isExternalDisplayAudio }
+            if let pos = externalAudioDevices.firstIndex(where: { $0.id == device.id }),
+               endpoints.indices.contains(pos) {
+                return endpoints[pos]
+            }
+            return endpoints.first
+        }
+
+        return nil
+    }
+}
