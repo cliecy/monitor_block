@@ -182,16 +182,51 @@ struct DisplayManagerTests {
         #expect(afterEnable[0].disabledByApp == false)
     }
 
-    @Test("禁止停用内置显示器")
-    func cannotDisableBuiltinDisplay() {
+    @Test("允许在有活跃外接屏时停用内置屏，但外接屏全部断开后自动恢复内置屏")
+    func canDisableBuiltinWhenExternalActiveAndAutoRecoverWhenUnplugged() throws {
         let backend = MockDisplayBackend()
-        backend.displays = [makeBuiltin(id: 1), makeExternal(id: 2)]
+        backend.displays = [makeBuiltin(id: 1, active: true), makeExternal(id: 2, active: true)]
         let manager = DisplayManager(backend: backend, store: InMemoryStateStore())
 
-        #expect(throws: MonitorBlockError.cannotDisableBuiltinDisplay) {
-            try manager.setExternalDisplay(id: 1, enabled: false)
-        }
-        #expect(backend.calls.isEmpty)
+        // 有活跃外接屏时，允许关闭内置屏
+        try manager.setDisplay(id: 1, enabled: false)
+        #expect(backend.calls.last?.displayID == 1)
+        #expect(backend.calls.last?.enabled == false)
+        #expect(manager.listDisplays(includeBuiltin: true).first(where: { $0.id == 1 })?.isActive == false)
+
+        // 模拟外接屏被拔出 -> 安全兜底应立即恢复内置屏
+        backend.displays.removeAll { $0.id == 2 }
+        manager.ensureBuiltinActiveIfNoExternalActive()
+        #expect(backend.calls.last?.displayID == 1)
+        #expect(backend.calls.last?.enabled == true)
+    }
+
+    @Test("为两台同型号显示器设置独立自定义名称并持久化同步")
+    func customNamingDistinguishesIdenticalMonitors() {
+        let backend = MockDisplayBackend()
+        backend.displays = [
+            makeBuiltin(id: 1),
+            makeExternal(id: 2, name: "LG UltraFine"),
+            makeExternal(id: 3, name: "LG UltraFine")
+        ]
+        let manager = DisplayManager(backend: backend, store: InMemoryStateStore())
+
+        manager.setCustomName("左 LG（主屏）", forDisplayUUID: "ext-uuid-2")
+        manager.setCustomName("右 LG（副屏）", forDisplayUUID: "ext-uuid-3")
+
+        let externals = manager.listDisplays(includeBuiltin: false)
+        let left = externals.first(where: { $0.uuid == "ext-uuid-2" })
+        let right = externals.first(where: { $0.uuid == "ext-uuid-3" })
+
+        #expect(left?.name == "左 LG（主屏）")
+        #expect(left?.systemName == "LG UltraFine")
+        #expect(right?.name == "右 LG（副屏）")
+
+        // 清空自定义名应恢复系统原名
+        manager.setCustomName("", forDisplayUUID: "ext-uuid-2")
+        let reset = manager.listDisplays(includeBuiltin: false).first(where: { $0.uuid == "ext-uuid-2" })
+        #expect(reset?.name == "LG UltraFine")
+        #expect(reset?.customName == nil)
     }
 
     @Test("合盖模式下禁止停用最后一块活跃外接屏")

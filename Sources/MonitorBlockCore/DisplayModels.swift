@@ -5,6 +5,8 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
     public let id: CGDirectDisplayID
     public let uuid: String
     public let name: String
+    public let systemName: String
+    public let customName: String?
     public let isBuiltin: Bool
     public let isActive: Bool
     public let isOnline: Bool
@@ -19,6 +21,8 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         id: CGDirectDisplayID,
         uuid: String,
         name: String,
+        systemName: String? = nil,
+        customName: String? = nil,
         isBuiltin: Bool,
         isActive: Bool,
         isOnline: Bool,
@@ -32,6 +36,8 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         self.id = id
         self.uuid = uuid
         self.name = name
+        self.systemName = systemName ?? name
+        self.customName = customName
         self.isBuiltin = isBuiltin
         self.isActive = isActive
         self.isOnline = isOnline

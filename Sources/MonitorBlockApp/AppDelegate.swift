@@ -38,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         manager.startObservingReconfiguration { [weak self] in
             Task { @MainActor in
-                self?.scheduleRefresh()
+                self?.scheduleRefresh(checkSafetyFallback: true)
             }
         }
 
@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.scheduleRefresh(delay: 0.6)
+                self?.scheduleRefresh(delay: 0.6, checkSafetyFallback: true)
             }
         }
     }
@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
         if autoRestoreOnQuit {
-            _ = try? manager.enableAllExternal()
+            _ = try? manager.enableAllDisplays()
         }
     }
 
@@ -71,32 +71,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - UI Refresh
 
-    private func scheduleRefresh(delay: TimeInterval = 0.25) {
+    private func scheduleRefresh(delay: TimeInterval = 0.25, checkSafetyFallback: Bool = false) {
         pendingRefreshWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
-            self?.refreshUI()
+            guard let self else { return }
+            if checkSafetyFallback {
+                self.manager.ensureBuiltinActiveIfNoExternalActive()
+            }
+            self.refreshUI()
         }
         pendingRefreshWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func refreshUI() {
-        let externals = manager.listDisplays(includeBuiltin: false)
-        updateStatusIcon(externals: externals)
-        rebuildMenu(externals: externals)
+        let allDisplays = manager.listDisplays(includeBuiltin: true)
+        updateStatusIcon(displays: allDisplays)
+        rebuildMenu(displays: allDisplays)
     }
 
-    private func updateStatusIcon(externals: [DisplayInfo]) {
+    private func updateStatusIcon(displays: [DisplayInfo]) {
         guard let button = statusItem.button else { return }
+        let externals = displays.filter { !$0.isBuiltin }
+        let activeCount = displays.filter(\.isActive).count
+
         let symbolName: String
         let tooltip: String
 
         if externals.isEmpty {
-            symbolName = "display"
-            tooltip = "MonitorBlock：未检测到外接显示器"
-        } else if externals.contains(where: \.isActive) {
+            symbolName = "laptopcomputer"
+            tooltip = "MonitorBlock：仅内置显示器"
+        } else if activeCount > 1 {
             symbolName = "display.2"
-            tooltip = "MonitorBlock：外接显示器使用中"
+            tooltip = "MonitorBlock：多屏使用中（\(activeCount) 块活跃）"
+        } else if externals.contains(where: \.isActive) {
+            symbolName = "display"
+            tooltip = "MonitorBlock：仅外接显示器使用中（内置屏已停用）"
         } else {
             symbolName = "laptopcomputer"
             tooltip = "MonitorBlock：外接显示器已停用"
@@ -108,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.toolTip = tooltip
     }
 
-    private func rebuildMenu(externals: [DisplayInfo]) {
+    private func rebuildMenu(displays: [DisplayInfo]) {
         menu.removeAllItems()
 
         if !manager.isPrivateAPIAvailable {
@@ -122,23 +132,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
-        let header = NSMenuItem(title: "外接显示器", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "显示器开关（点击启用/停用）", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        if externals.isEmpty {
-            let emptyItem = NSMenuItem(title: "  未检测到外接显示器", action: nil, keyEquivalent: "")
+        if displays.isEmpty {
+            let emptyItem = NSMenuItem(title: "  未检测到显示器", action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
             menu.addItem(emptyItem)
         } else {
-            for display in externals {
+            for display in displays {
                 var title = display.name
+                if display.isBuiltin {
+                    title += " [内置]"
+                }
                 if let res = display.resolutionText {
                     title += "  (\(res))"
                 }
                 if !display.isActive {
                     title += " [已停用]"
-                } else if manager.disableRule(forDisplayUUID: display.uuid) != nil {
+                } else if display.isMain {
+                    title += " ★"
+                }
+                if manager.disableRule(forDisplayUUID: display.uuid) != nil {
                     title += " • 已配关闭规则"
                 }
 
@@ -155,6 +171,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+
+        let identifyItem = NSMenuItem(
+            title: "识别显示器（屏幕闪显名称）",
+            action: #selector(identifyAllDisplays),
+            keyEquivalent: "i"
+        )
+        identifyItem.target = self
+        menu.addItem(identifyItem)
 
         // 布局预设子菜单
         let presetsMenu = NSMenu()
@@ -189,7 +213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(presetsParent)
 
         let openEditorItem = NSMenuItem(
-            title: "布局与关闭规则设置…",
+            title: "命名、布局与关闭规则设置…",
             action: #selector(openLayoutEditor),
             keyEquivalent: ","
         )
@@ -198,25 +222,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let externals = displays.filter { !$0.isBuiltin }
         let hasActiveExternal = externals.contains(where: \.isActive)
-        let hasDisabledExternal = externals.contains { !$0.isActive || $0.disabledByApp }
+        let hasAnyDisabled = displays.contains { !$0.isActive || $0.disabledByApp }
 
-        let disableAllItem = NSMenuItem(
-            title: "全部停用外接显示器",
+        let disableAllExtItem = NSMenuItem(
+            title: "停用全部外接显示器",
             action: #selector(disableAllExternalDisplays),
             keyEquivalent: ""
         )
-        disableAllItem.target = self
-        disableAllItem.isEnabled = hasActiveExternal
-        menu.addItem(disableAllItem)
+        disableAllExtItem.target = self
+        disableAllExtItem.isEnabled = hasActiveExternal
+        menu.addItem(disableAllExtItem)
 
         let enableAllItem = NSMenuItem(
-            title: "全部恢复外接显示器",
-            action: #selector(enableAllExternalDisplays),
+            title: "恢复全部已停用显示器",
+            action: #selector(enableAllDisplays),
             keyEquivalent: ""
         )
         enableAllItem.target = self
-        enableAllItem.isEnabled = hasDisabledExternal
+        enableAllItem.isEnabled = hasAnyDisabled
         menu.addItem(enableAllItem)
 
         let refreshItem = NSMenuItem(
@@ -239,7 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(launchAtLoginItem)
 
         let autoRestoreItem = NSMenuItem(
-            title: "退出时自动恢复外接显示器",
+            title: "退出时自动恢复所有已停用显示器",
             action: #selector(toggleAutoRestore),
             keyEquivalent: ""
         )
@@ -262,11 +287,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let number = sender.representedObject as? NSNumber else { return }
         let displayID = CGDirectDisplayID(number.uint32Value)
         do {
-            try manager.toggleExternal(id: displayID)
+            try manager.toggleDisplay(id: displayID)
             scheduleRefresh(delay: 0.25)
         } catch {
             showError(error)
         }
+    }
+
+    @objc private func identifyAllDisplays() {
+        let displays = manager.listDisplays(includeBuiltin: true)
+        DisplayIdentifierOverlay.shared.identify(displays: displays)
     }
 
     @objc private func applyPresetMenuItem(_ sender: NSMenuItem) {
@@ -316,9 +346,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func enableAllExternalDisplays() {
+    @objc private func enableAllDisplays() {
         do {
-            try manager.enableAllExternal()
+            try manager.enableAllDisplays()
             scheduleRefresh(delay: 0.25)
         } catch {
             showError(error)

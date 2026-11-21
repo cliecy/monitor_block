@@ -8,6 +8,7 @@ public final class DisplayManager {
     private var presets: [LayoutPreset]
     private var disableRules: [String: DisableLayoutRule]
     private var preDisableSnapshots: [String: [DisplayPlacement]]
+    private var customNames: [String: String]
 
     public var isPrivateAPIAvailable: Bool {
         backend.isPrivateAPIAvailable
@@ -24,6 +25,7 @@ public final class DisplayManager {
         self.presets = loaded.presets
         self.disableRules = loaded.disableRules
         self.preDisableSnapshots = loaded.preDisableSnapshots
+        self.customNames = loaded.customNames
     }
 
     private func persist() {
@@ -31,7 +33,8 @@ public final class DisplayManager {
             cachedDisplays: cache.values.sorted { $0.id < $1.id },
             presets: presets,
             disableRules: disableRules,
-            preDisableSnapshots: preDisableSnapshots
+            preDisableSnapshots: preDisableSnapshots,
+            customNames: customNames
         )
         store.saveState(state)
     }
@@ -48,16 +51,19 @@ public final class DisplayManager {
             liveIDs.insert(snap.id)
 
             let existing = cache[snap.id]
-            let resolvedName: String
+            let systemName: String
             if let name = snap.name, !name.isEmpty {
-                resolvedName = name
+                systemName = name
             } else if let cachedName = existing?.name, !cachedName.isEmpty {
-                resolvedName = cachedName
+                systemName = cachedName
             } else if snap.isBuiltin {
-                resolvedName = "内置显示器"
+                systemName = "内置显示器"
             } else {
-                resolvedName = "外接显示器 #\(snap.id)"
+                systemName = "外接显示器 #\(snap.id)"
             }
+
+            let customName = customNames[snap.uuid]
+            let resolvedName = customName ?? systemName
 
             let resolvedWidth = snap.width > 0 ? snap.width : (existing?.width ?? 0)
             let resolvedHeight = snap.height > 0 ? snap.height : (existing?.height ?? 0)
@@ -68,19 +74,18 @@ public final class DisplayManager {
                 cacheChanged = true
             }
 
-            if !snap.isBuiltin {
-                let updated = CachedDisplayRecord(
-                    id: snap.id,
-                    uuid: snap.uuid,
-                    name: resolvedName,
-                    width: resolvedWidth,
-                    height: resolvedHeight,
-                    disabledByApp: disabledByApp
-                )
-                if cache[snap.id] != updated {
-                    cache[snap.id] = updated
-                    cacheChanged = true
-                }
+            let updated = CachedDisplayRecord(
+                id: snap.id,
+                uuid: snap.uuid,
+                name: systemName,
+                width: resolvedWidth,
+                height: resolvedHeight,
+                disabledByApp: disabledByApp,
+                isBuiltin: snap.isBuiltin
+            )
+            if cache[snap.id] != updated {
+                cache[snap.id] = updated
+                cacheChanged = true
             }
 
             if includeBuiltin || !snap.isBuiltin {
@@ -89,6 +94,8 @@ public final class DisplayManager {
                         id: snap.id,
                         uuid: snap.uuid,
                         name: resolvedName,
+                        systemName: systemName,
+                        customName: customName,
                         isBuiltin: snap.isBuiltin,
                         isActive: snap.isActive,
                         isOnline: snap.isOnline,
@@ -104,12 +111,18 @@ public final class DisplayManager {
         }
 
         for (id, record) in cache where record.disabledByApp && !liveIDs.contains(id) {
+            if !includeBuiltin && record.isBuiltin {
+                continue
+            }
+            let customName = customNames[record.uuid]
             results.append(
                 DisplayInfo(
                     id: record.id,
                     uuid: record.uuid,
-                    name: record.name,
-                    isBuiltin: false,
+                    name: customName ?? record.name,
+                    systemName: record.name,
+                    customName: customName,
+                    isBuiltin: record.isBuiltin,
                     isActive: false,
                     isOnline: false,
                     originX: 0,
@@ -139,14 +152,11 @@ public final class DisplayManager {
 
     // MARK: - Enable / Disable with Layout Rules
 
-    public func setExternalDisplay(id: CGDirectDisplayID, enabled: Bool) throws {
+    /// 启用或停用任意显示器（支持内置屏与外接屏，但严格禁止停用最后一块活跃屏）
+    public func setDisplay(id: CGDirectDisplayID, enabled: Bool) throws {
         let allDisplays = listDisplays(includeBuiltin: true)
         guard let target = allDisplays.first(where: { $0.id == id }) else {
             throw MonitorBlockError.displayNotFound(id)
-        }
-
-        if target.isBuiltin {
-            throw MonitorBlockError.cannotDisableBuiltinDisplay
         }
 
         if !enabled {
@@ -166,12 +176,14 @@ public final class DisplayManager {
         var record = cache[id] ?? CachedDisplayRecord(
             id: target.id,
             uuid: target.uuid,
-            name: target.name,
+            name: target.systemName,
             width: target.width,
             height: target.height,
-            disabledByApp: !enabled
+            disabledByApp: !enabled,
+            isBuiltin: target.isBuiltin
         )
         record.disabledByApp = !enabled
+        record.isBuiltin = target.isBuiltin
         cache[id] = record
         persist()
 
@@ -189,6 +201,61 @@ public final class DisplayManager {
                 persist()
             }
         }
+    }
+
+    public func setExternalDisplay(id: CGDirectDisplayID, enabled: Bool) throws {
+        try setDisplay(id: id, enabled: enabled)
+    }
+
+    /// 紧急安全兜底：如果所有外接屏都断开/不可用，且内置屏处于被停用状态，立即恢复内置屏防止黑屏锁死
+    public func ensureBuiltinActiveIfNoExternalActive() {
+        let allDisplays = listDisplays(includeBuiltin: true)
+        let activeExternals = allDisplays.filter { !$0.isBuiltin && $0.isActive }
+        guard activeExternals.isEmpty else { return }
+
+        let disabledBuiltins = allDisplays.filter { $0.isBuiltin && (!$0.isActive || $0.disabledByApp) }
+        for builtin in disabledBuiltins {
+            try? setDisplay(id: builtin.id, enabled: true)
+        }
+    }
+
+    /// 恢复全部处于停用状态的显示器（含内置屏与外接屏）
+    @discardableResult
+    public func enableAllDisplays() throws -> [CGDirectDisplayID] {
+        let all = listDisplays(includeBuiltin: true)
+        let toEnable = all.filter { !$0.isActive || $0.disabledByApp }
+        var enabledIDs: [CGDirectDisplayID] = []
+        var firstError: Error?
+
+        for display in toEnable {
+            do {
+                try setDisplay(id: display.id, enabled: true)
+                enabledIDs.append(display.id)
+            } catch {
+                if var record = cache[display.id] {
+                    record.disabledByApp = false
+                    cache[display.id] = record
+                    persist()
+                }
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+
+        if enabledIDs.isEmpty, let firstError {
+            throw firstError
+        }
+        return enabledIDs
+    }
+
+    /// 切换指定显示器（内置或外接）状态
+    public func toggleDisplay(id: CGDirectDisplayID) throws {
+        let displays = listDisplays(includeBuiltin: true)
+        guard let target = displays.first(where: { $0.id == id }) else {
+            throw MonitorBlockError.displayNotFound(id)
+        }
+        try setDisplay(id: id, enabled: !target.isActive)
     }
 
     @discardableResult
@@ -375,6 +442,49 @@ public final class DisplayManager {
 
     public func deleteDisableRule(forDisplayUUID uuid: String) {
         disableRules.removeValue(forKey: uuid)
+        persist()
+    }
+
+    // MARK: - Custom Display Naming
+
+    public func customName(forDisplayUUID uuid: String) -> String? {
+        customNames[uuid]
+    }
+
+    /// 设置或清除（传 nil/空串）指定显示器的自定义名称，同步刷新规则与预设中的显示名
+    public func setCustomName(_ name: String?, forDisplayUUID uuid: String) {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty {
+            customNames.removeValue(forKey: uuid)
+        } else {
+            customNames[uuid] = trimmed
+        }
+
+        let latestName = listDisplays(includeBuiltin: true).first(where: { $0.uuid == uuid })?.name
+            ?? (trimmed.isEmpty ? nil : trimmed)
+
+        if let latestName {
+            for pIdx in presets.indices {
+                for idx in presets[pIdx].placements.indices where presets[pIdx].placements[idx].uuid == uuid {
+                    presets[pIdx].placements[idx].name = latestName
+                }
+            }
+            for (ruleKey, var rule) in disableRules {
+                var modified = false
+                if rule.targetDisplayUUID == uuid {
+                    rule.targetDisplayName = latestName
+                    modified = true
+                }
+                for idx in rule.layoutOnDisable.indices where rule.layoutOnDisable[idx].uuid == uuid {
+                    rule.layoutOnDisable[idx].name = latestName
+                    modified = true
+                }
+                if modified {
+                    disableRules[ruleKey] = rule
+                }
+            }
+        }
+
         persist()
     }
 

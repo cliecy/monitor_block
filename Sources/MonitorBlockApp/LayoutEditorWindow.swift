@@ -13,13 +13,13 @@ final class LayoutEditorWindowController: NSWindowController {
         let hostingController = NSHostingController(rootView: rootView)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 560),
+            contentRect: NSRect(x: 0, y: 0, width: 780, height: 610),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "MonitorBlock — 布局与关闭规则"
-        window.minSize = NSSize(width: 680, height: 500)
+        window.title = "MonitorBlock — 命名、布局与关闭规则"
+        window.minSize = NSSize(width: 700, height: 540)
         window.contentViewController = hostingController
         window.center()
         window.isReleasedWhenClosed = false
@@ -43,7 +43,7 @@ final class LayoutEditorWindowController: NSWindowController {
 @MainActor
 final class LayoutEditorViewModel: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable {
-        case arrangement = "实时布局"
+        case arrangement = "命名与实时布局"
         case disableRules = "关闭后布局规则"
         var id: String { rawValue }
     }
@@ -54,16 +54,18 @@ final class LayoutEditorViewModel: ObservableObject {
 
     @Published var selectedTab: Tab = .arrangement
     @Published var allDisplays: [DisplayInfo] = []
-    @Published var externalDisplays: [DisplayInfo] = []
 
-    // Tab 1: 实时布局
+    // Tab 1: 实时布局 + 自定义命名
     @Published var livePlacements: [DisplayPlacement] = []
-    @Published var selectedLiveUUID: String?
+    @Published var selectedLiveUUID: String? {
+        didSet { syncRenameDraft() }
+    }
+    @Published var renameDraft: String = ""
     @Published var presets: [LayoutPreset] = []
     @Published var newPresetName: String = ""
 
-    // Tab 2: 关闭后布局规则
-    @Published var selectedTargetExternalUUID: String?
+    // Tab 2: 关闭后布局规则（支持任意显示器，含内置屏和外接屏）
+    @Published var selectedTargetDisplayUUID: String?
     @Published var rulePlacements: [DisplayPlacement] = []
     @Published var selectedRuleUUID: String?
     @Published var restorePreviousOnEnable: Bool = true
@@ -86,19 +88,56 @@ final class LayoutEditorViewModel: ObservableObject {
 
     func reload() {
         allDisplays = manager.listDisplays(includeBuiltin: true)
-        externalDisplays = allDisplays.filter { !$0.isBuiltin }
         livePlacements = manager.captureCurrentLayout()
         presets = manager.listPresets()
         savedRuleUUIDs = Set(manager.listDisableRules().map(\.targetDisplayUUID))
 
         if selectedLiveUUID == nil || !livePlacements.contains(where: { $0.uuid == selectedLiveUUID }) {
             selectedLiveUUID = livePlacements.first?.uuid
+        } else {
+            syncRenameDraft()
         }
 
-        if selectedTargetExternalUUID == nil || !externalDisplays.contains(where: { $0.uuid == selectedTargetExternalUUID }) {
-            selectedTargetExternalUUID = externalDisplays.first?.uuid
+        if selectedTargetDisplayUUID == nil || !allDisplays.contains(where: { $0.uuid == selectedTargetDisplayUUID }) {
+            selectedTargetDisplayUUID = allDisplays.first(where: { !$0.isBuiltin })?.uuid ?? allDisplays.first?.uuid
         }
         loadRuleForSelectedTarget()
+    }
+
+    func syncRenameDraft() {
+        guard let uuid = selectedLiveUUID,
+              let info = allDisplays.first(where: { $0.uuid == uuid }) else {
+            renameDraft = ""
+            return
+        }
+        renameDraft = info.customName ?? info.name
+    }
+
+    // MARK: - Identify & Rename
+
+    func identifyAll() {
+        DisplayIdentifierOverlay.shared.identify(displays: allDisplays)
+    }
+
+    func identifySelectedLive() {
+        guard let uuid = selectedLiveUUID else { return }
+        DisplayIdentifierOverlay.shared.identify(displays: allDisplays, onlyUUID: uuid)
+    }
+
+    func saveRenameForSelectedLive() {
+        guard let uuid = selectedLiveUUID else { return }
+        manager.setCustomName(renameDraft, forDisplayUUID: uuid)
+        setStatus("已更新显示器名称", isError: false)
+        reload()
+        onDidMutate()
+    }
+
+    func resetNameForSelectedLive() {
+        guard let uuid = selectedLiveUUID else { return }
+        manager.setCustomName(nil, forDisplayUUID: uuid)
+        setStatus("已恢复系统默认名称", isError: false)
+        reload()
+        onDidMutate()
     }
 
     // MARK: - Tab 1 Actions
@@ -142,13 +181,13 @@ final class LayoutEditorViewModel: ObservableObject {
 
     // MARK: - Tab 2 Actions
 
-    func selectTargetExternal(uuid: String) {
-        selectedTargetExternalUUID = uuid
+    func selectTargetDisplay(uuid: String) {
+        selectedTargetDisplayUUID = uuid
         loadRuleForSelectedTarget()
     }
 
     func loadRuleForSelectedTarget() {
-        guard let targetUUID = selectedTargetExternalUUID else {
+        guard let targetUUID = selectedTargetDisplayUUID else {
             rulePlacements = []
             selectedRuleUUID = nil
             return
@@ -158,7 +197,6 @@ final class LayoutEditorViewModel: ObservableObject {
             rulePlacements = existing.layoutOnDisable
             restorePreviousOnEnable = existing.restorePreviousOnEnable
         } else {
-            // 默认基于当前屏幕列表，剔除目标屏幕后生成初始剩余布局
             let remaining = allDisplays.filter { $0.uuid != targetUUID }
             var placements = remaining.map {
                 DisplayPlacement(
@@ -184,8 +222,8 @@ final class LayoutEditorViewModel: ObservableObject {
     }
 
     func saveRuleForSelectedTarget() {
-        guard let targetUUID = selectedTargetExternalUUID,
-              let target = externalDisplays.first(where: { $0.uuid == targetUUID }) else {
+        guard let targetUUID = selectedTargetDisplayUUID,
+              let target = allDisplays.first(where: { $0.uuid == targetUUID }) else {
             return
         }
         let normalized = Self.normalized(rulePlacements)
@@ -203,8 +241,8 @@ final class LayoutEditorViewModel: ObservableObject {
     }
 
     func deleteRuleForSelectedTarget() {
-        guard let targetUUID = selectedTargetExternalUUID,
-              let target = externalDisplays.first(where: { $0.uuid == targetUUID }) else {
+        guard let targetUUID = selectedTargetDisplayUUID,
+              let target = allDisplays.first(where: { $0.uuid == targetUUID }) else {
             return
         }
         manager.deleteDisableRule(forDisplayUUID: targetUUID)
@@ -215,7 +253,7 @@ final class LayoutEditorViewModel: ObservableObject {
     }
 
     func captureCurrentIntoRule() {
-        guard let targetUUID = selectedTargetExternalUUID else { return }
+        guard let targetUUID = selectedTargetDisplayUUID else { return }
         let current = manager.captureCurrentLayout().filter { $0.uuid != targetUUID }
         guard !current.isEmpty else {
             setStatus("当前没有可捕获的剩余活跃屏幕", isError: true)
@@ -307,12 +345,20 @@ struct LayoutEditorRootView: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            Picker("", selection: $viewModel.selectedTab) {
-                ForEach(LayoutEditorViewModel.Tab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
+            HStack {
+                Picker("", selection: $viewModel.selectedTab) {
+                    ForEach(LayoutEditorViewModel.Tab.allCases) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Button {
+                    viewModel.identifyAll()
+                } label: {
+                    Label("识别所有屏幕", systemImage: "sparkles.tv")
                 }
             }
-            .pickerStyle(.segmented)
             .padding(.horizontal, 16)
             .padding(.top, 12)
 
@@ -334,11 +380,11 @@ struct LayoutEditorRootView: View {
                 .padding(.bottom, 10)
             }
         }
-        .frame(minWidth: 680, minHeight: 500)
+        .frame(minWidth: 700, minHeight: 540)
     }
 
     private var liveArrangementView: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             DisplayArrangementCanvas(
                 placements: $viewModel.livePlacements,
                 selectedUUID: $viewModel.selectedLiveUUID,
@@ -352,6 +398,32 @@ struct LayoutEditorRootView: View {
                 inLive: true
             )
             .padding(.horizontal, 16)
+
+            // 自定义命名栏（方便区分两台同型号显示器）
+            if let selectedUUID = viewModel.selectedLiveUUID,
+               let info = viewModel.allDisplays.first(where: { $0.uuid == selectedUUID }) {
+                HStack(spacing: 8) {
+                    Text("自定义名称：")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("例如：左 LG / 右 LG（竖屏）", text: $viewModel.renameDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 210)
+                    Button("保存名称") {
+                        viewModel.saveRenameForSelectedLive()
+                    }
+                    if info.customName != nil {
+                        Button("恢复默认") {
+                            viewModel.resetNameForSelectedLive()
+                        }
+                    }
+                    Spacer()
+                    Button("识别此屏") {
+                        viewModel.identifySelectedLive()
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
 
             HStack(spacing: 8) {
                 Button("刷新当前布局") {
@@ -418,9 +490,9 @@ struct LayoutEditorRootView: View {
 
     private var disableRulesView: some View {
         VStack(spacing: 12) {
-            if viewModel.externalDisplays.isEmpty {
+            if viewModel.allDisplays.count <= 1 {
                 Spacer()
-                Text("未检测到外接显示器。连接外接显示器后即可为其配置“关闭后布局规则”。")
+                Text("至少需要连接 2 块显示器才能配置“关闭某屏后的剩余布局规则”。")
                     .foregroundColor(.secondary)
                 Spacer()
             } else {
@@ -430,16 +502,17 @@ struct LayoutEditorRootView: View {
                     Picker(
                         "",
                         selection: Binding(
-                            get: { viewModel.selectedTargetExternalUUID ?? "" },
-                            set: { viewModel.selectTargetExternal(uuid: $0) }
+                            get: { viewModel.selectedTargetDisplayUUID ?? "" },
+                            set: { viewModel.selectTargetDisplay(uuid: $0) }
                         )
                     ) {
-                        ForEach(viewModel.externalDisplays) { display in
+                        ForEach(viewModel.allDisplays) { display in
+                            let builtinTag = display.isBuiltin ? " [内置]" : ""
                             let badge = viewModel.savedRuleUUIDs.contains(display.uuid) ? "（已配置）" : ""
-                            Text("\(display.name)\(badge)").tag(display.uuid)
+                            Text("\(display.name)\(builtinTag)\(badge)").tag(display.uuid)
                         }
                     }
-                    .frame(width: 260)
+                    .frame(width: 280)
 
                     Spacer()
 
@@ -474,7 +547,7 @@ struct LayoutEditorRootView: View {
 
                     Spacer()
 
-                    if let targetUUID = viewModel.selectedTargetExternalUUID,
+                    if let targetUUID = viewModel.selectedTargetDisplayUUID,
                        viewModel.savedRuleUUIDs.contains(targetUUID) {
                         Button("清除规则", role: .destructive) {
                             viewModel.deleteRuleForSelectedTarget()
@@ -592,7 +665,7 @@ struct DisplayArrangementCanvas: View {
                 }
             }
         }
-        .frame(minHeight: 240, maxHeight: 280)
+        .frame(minHeight: 230, maxHeight: 260)
     }
 
     private func displayTile(item: DisplayPlacement, isSelected: Bool) -> some View {
@@ -605,7 +678,6 @@ struct DisplayArrangementCanvas: View {
                 )
 
             if item.isMain {
-                // 模拟 macOS 主屏顶部的白色菜单栏条
                 Rectangle()
                     .fill(Color.accentColor.opacity(0.85))
                     .frame(height: 6)
@@ -658,7 +730,6 @@ struct DisplayArrangementCanvas: View {
         return (scale, offsetX, offsetY)
     }
 
-    /// 拖拽松手时，将当前屏幕自动吸附到最近的相邻屏幕边缘，避免缝隙或重叠
     private func snapDisplay(at index: Int) {
         guard placements.count > 1 else { return }
         let moving = placements[index]
@@ -670,13 +741,9 @@ struct DisplayArrangementCanvas: View {
 
         for other in others {
             let candidates: [(Int, Int)] = [
-                // 贴在 other 左侧
                 (other.x - moving.width, clamp(moving.y, min: other.y - moving.height + 120, max: other.y + other.height - 120)),
-                // 贴在 other 右侧
                 (other.x + other.width, clamp(moving.y, min: other.y - moving.height + 120, max: other.y + other.height - 120)),
-                // 贴在 other 上方
                 (clamp(moving.x, min: other.x - moving.width + 120, max: other.x + other.width - 120), other.y - moving.height),
-                // 贴在 other 下方
                 (clamp(moving.x, min: other.x - moving.width + 120, max: other.x + other.width - 120), other.y + other.height)
             ]
 

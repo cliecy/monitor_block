@@ -8,6 +8,7 @@ public struct CachedDisplayRecord: Codable, Equatable, Sendable {
     public var width: Int
     public var height: Int
     public var disabledByApp: Bool
+    public var isBuiltin: Bool
 
     public init(
         id: CGDirectDisplayID,
@@ -15,7 +16,8 @@ public struct CachedDisplayRecord: Codable, Equatable, Sendable {
         name: String,
         width: Int,
         height: Int,
-        disabledByApp: Bool
+        disabledByApp: Bool,
+        isBuiltin: Bool = false
     ) {
         self.id = id
         self.uuid = uuid
@@ -23,6 +25,22 @@ public struct CachedDisplayRecord: Codable, Equatable, Sendable {
         self.width = width
         self.height = height
         self.disabledByApp = disabledByApp
+        self.isBuiltin = isBuiltin
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, uuid, name, width, height, disabledByApp, isBuiltin
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(CGDirectDisplayID.self, forKey: .id)
+        self.uuid = try container.decode(String.self, forKey: .uuid)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.width = try container.decode(Int.self, forKey: .width)
+        self.height = try container.decode(Int.self, forKey: .height)
+        self.disabledByApp = try container.decode(Bool.self, forKey: .disabledByApp)
+        self.isBuiltin = try container.decodeIfPresent(Bool.self, forKey: .isBuiltin) ?? false
     }
 }
 
@@ -31,17 +49,37 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
     public var presets: [LayoutPreset]
     public var disableRules: [String: DisableLayoutRule]
     public var preDisableSnapshots: [String: [DisplayPlacement]]
+    public var customNames: [String: String]
 
     public init(
         cachedDisplays: [CachedDisplayRecord] = [],
         presets: [LayoutPreset] = [],
         disableRules: [String: DisableLayoutRule] = [:],
-        preDisableSnapshots: [String: [DisplayPlacement]] = [:]
+        preDisableSnapshots: [String: [DisplayPlacement]] = [:],
+        customNames: [String: String] = [:]
     ) {
         self.cachedDisplays = cachedDisplays
         self.presets = presets
         self.disableRules = disableRules
         self.preDisableSnapshots = preDisableSnapshots
+        self.customNames = customNames
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case cachedDisplays
+        case presets
+        case disableRules
+        case preDisableSnapshots
+        case customNames
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.cachedDisplays = try container.decodeIfPresent([CachedDisplayRecord].self, forKey: .cachedDisplays) ?? []
+        self.presets = try container.decodeIfPresent([LayoutPreset].self, forKey: .presets) ?? []
+        self.disableRules = try container.decodeIfPresent([String: DisableLayoutRule].self, forKey: .disableRules) ?? [:]
+        self.preDisableSnapshots = try container.decodeIfPresent([String: [DisplayPlacement]].self, forKey: .preDisableSnapshots) ?? [:]
+        self.customNames = try container.decodeIfPresent([String: String].self, forKey: .customNames) ?? [:]
     }
 }
 
