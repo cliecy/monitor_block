@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="Resources/AppIcon.png" width="128" height="128" alt="MonitorBlock Icon" />
+</p>
+
 # MonitorBlock
 
-轻量级 macOS 菜单栏工具，用于在 Apple Silicon Mac 上**随时安全地启用/停用外接显示器、调整多屏布局，并配置关闭屏幕后的自动布局规则**。
+轻量级 macOS 菜单栏工具，用于在 Apple Silicon Mac 上**随时安全地启用/停用任意显示器（含 MacBook 内置屏与外接屏）、自定义显示器名称、调整多屏布局，并配置关闭屏幕后的自动布局规则**。
 
 ## 特性
 

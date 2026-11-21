@@ -7,6 +7,7 @@ BUILD_DIR="$ROOT_DIR/build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 echo "==> Building release binary..."
 cd "$ROOT_DIR"
@@ -18,10 +19,14 @@ BIN_PATH="$(swift build -c release ${SWIFT_BUILD_FLAGS:-} --show-bin-path)/Monit
 
 echo "==> Assembling $APP_BUNDLE..."
 rm -rf "$APP_BUNDLE"
-mkdir -p "$MACOS_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
+
+if [ -f "$ROOT_DIR/Resources/AppIcon.icns" ]; then
+    cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +37,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<'EOF'
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
     <string>MonitorBlock</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>local.cliecy.MonitorBlock</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -41,9 +48,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.0</string>
+    <string>1.1.1</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>3</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
