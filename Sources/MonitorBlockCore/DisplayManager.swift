@@ -29,12 +29,14 @@ public final class DisplayManager {
     }
 
     private func persist() {
+        let existingBindings = store.loadState().audioToDDCBindings
         let state = PersistedAppState(
             cachedDisplays: cache.values.sorted { $0.id < $1.id },
             presets: presets,
             disableRules: disableRules,
             preDisableSnapshots: preDisableSnapshots,
-            customNames: customNames
+            customNames: customNames,
+            audioToDDCBindings: existingBindings
         )
         store.saveState(state)
     }

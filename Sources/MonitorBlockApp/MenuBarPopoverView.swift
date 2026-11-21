@@ -12,6 +12,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
     @Published var volume: Double = 0.5
     @Published var isMuted: Bool = false
     @Published var volumeMode: VolumeControlMode = .unsupported
+    @Published var volumeTargetName: String?
     @Published var ddcVolumes: [Int: Double] = [:]
     @Published var ddcMuted: [Int: Bool] = [:]
 
@@ -69,6 +70,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
         volume = snapshot.volume
         isMuted = snapshot.isMuted
         volumeMode = snapshot.mode
+        volumeTargetName = snapshot.deviceName
 
         ddcEndpoints = audioManager.listDDCEndpoints()
         for ep in ddcEndpoints {
@@ -231,6 +233,26 @@ final class MenuBarPopoverViewModel: ObservableObject {
             return idx
         }
         return nil
+    }
+
+    /// 为同名音频输出设备（如两台 LG HDR 4K）生成带 #1 / #2 区分后缀的显示名
+    func displayTitle(for device: AudioOutputDevice) -> String {
+        let sameName = audioDevices.filter { $0.name == device.name }
+        guard sameName.count > 1,
+              let idx = sameName.firstIndex(where: { $0.id == device.id }) else {
+            return device.name
+        }
+        return "\(device.name) #\(idx + 1)"
+    }
+
+    /// 为同名 DDC 端点生成带 #1 / #2 区分后缀的显示名
+    func displayTitle(for endpoint: DDCDisplayEndpoint) -> String {
+        let sameName = ddcEndpoints.filter { $0.name == endpoint.name }
+        guard sameName.count > 1,
+              let idx = sameName.firstIndex(where: { $0.index == endpoint.index }) else {
+            return endpoint.name
+        }
+        return "\(endpoint.name) #\(idx + 1)"
     }
 
     // MARK: - App Actions
@@ -483,6 +505,18 @@ struct MenuBarPopoverView: View {
 
             // 主音量控制滑块（CoreAudio 或自动绑定的外接屏 DDC 音量）
             VStack(spacing: 6) {
+                if let targetName = viewModel.volumeTargetName {
+                    HStack(spacing: 4) {
+                        Text("主音量目标：")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                        Text(mainTargetDisplayTitle(fallback: targetName))
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                }
+
                 HStack(spacing: 8) {
                     Button {
                         viewModel.toggleMainMute()
@@ -510,10 +544,9 @@ struct MenuBarPopoverView: View {
                         .frame(width: 34, alignment: .trailing)
                 }
 
-                // 直接在主音量下方整合显示所有外接屏 DDC 音量（无需折叠展开，每台自带独立静音 + 滑块）
+                // 直接在主音量下方整合显示所有外接屏 DDC 音量（无需折叠展开，每台自带独立静音 + 滑块 + 一键联动）
                 if !viewModel.ddcEndpoints.isEmpty {
                     let endpointsToShow: [DDCDisplayEndpoint] = {
-                        // 如果只有 1 台外接屏且主音量已经在控制它，无需重复显示两行相同滑块
                         if viewModel.ddcEndpoints.count == 1,
                            viewModel.activeDDCEndpointIndex == viewModel.ddcEndpoints[0].index {
                             return []
@@ -529,6 +562,7 @@ struct MenuBarPopoverView: View {
                             let epVol = viewModel.ddcVolumes[ep.index] ?? 0.5
                             let epMuted = viewModel.ddcMuted[ep.index] ?? false
                             let isLinkedToMain = (viewModel.activeDDCEndpointIndex == ep.index)
+                            let epTitle = viewModel.displayTitle(for: ep)
 
                             HStack(spacing: 6) {
                                 Button {
@@ -541,25 +575,10 @@ struct MenuBarPopoverView: View {
                                 }
                                 .buttonStyle(.plain)
 
-                                Button {
-                                    if viewModel.activeDDCEndpointIndex != nil {
-                                        viewModel.bindActiveAudioToDDC(endpointIndex: ep.index)
-                                    }
-                                } label: {
-                                    HStack(spacing: 3) {
-                                        Text("\(ep.name)")
-                                            .font(.system(size: 11, weight: isLinkedToMain ? .semibold : .regular))
-                                            .lineLimit(1)
-                                        if isLinkedToMain {
-                                            Image(systemName: "link")
-                                                .font(.system(size: 9))
-                                                .foregroundColor(.teal)
-                                        }
-                                    }
-                                    .frame(width: 94, alignment: .leading)
-                                }
-                                .buttonStyle(.plain)
-                                .help(viewModel.activeDDCEndpointIndex != nil ? "点击将当前输出主音量绑定到此显示器" : ep.name)
+                                Text(epTitle)
+                                    .font(.system(size: 11, weight: isLinkedToMain ? .semibold : .regular))
+                                    .lineLimit(1)
+                                    .frame(width: 82, alignment: .leading)
 
                                 Slider(
                                     value: Binding(
@@ -572,7 +591,18 @@ struct MenuBarPopoverView: View {
                                 Text("\(Int((epMuted ? 0 : epVol * 100).rounded()))%")
                                     .font(.system(size: 10, design: .monospaced))
                                     .foregroundColor(.secondary)
-                                    .frame(width: 30, alignment: .trailing)
+                                    .frame(width: 28, alignment: .trailing)
+
+                                if viewModel.activeDDCEndpointIndex != nil {
+                                    Button(isLinkedToMain ? "已联动" : "联动") {
+                                        viewModel.bindActiveAudioToDDC(endpointIndex: ep.index)
+                                    }
+                                    .font(.system(size: 9.5, weight: .medium))
+                                    .buttonStyle(.bordered)
+                                    .tint(isLinkedToMain ? .teal : .secondary)
+                                    .controlSize(.mini)
+                                    .help("将当前音频输出的主音量绑定到此显示器（会自动记住）")
+                                }
                             }
                         }
                     }
@@ -608,7 +638,7 @@ struct MenuBarPopoverView: View {
                     .background(device.isDefault ? Color.accentColor : Color.secondary.opacity(0.15))
                     .clipShape(Circle())
 
-                Text(device.name)
+                Text(viewModel.displayTitle(for: device))
                     .font(.system(size: 12, weight: device.isDefault ? .semibold : .regular))
                     .foregroundColor(.primary)
                     .lineLimit(1)
@@ -726,6 +756,17 @@ struct MenuBarPopoverView: View {
             .padding(.vertical, 1.5)
             .background(color.opacity(0.14))
             .cornerRadius(4)
+    }
+
+    private func mainTargetDisplayTitle(fallback: String) -> String {
+        if let activeIdx = viewModel.activeDDCEndpointIndex,
+           let ep = viewModel.ddcEndpoints.first(where: { $0.index == activeIdx }) {
+            return viewModel.displayTitle(for: ep)
+        }
+        if let activeDevice = viewModel.audioDevices.first(where: \.isDefault) {
+            return viewModel.displayTitle(for: activeDevice)
+        }
+        return fallback
     }
 
     private func volumeSymbol(level: Double, muted: Bool) -> String {

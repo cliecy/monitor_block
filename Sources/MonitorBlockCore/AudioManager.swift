@@ -404,17 +404,21 @@ public final class CoreAudioBackend: AudioBackend {
 public final class AudioManager {
     private let audioBackend: AudioBackend
     private let ddcBackend: DDCBackend
+    private let store: StateStoreProtocol
     private var cachedDDCVolumes: [Int: Int] = [:]
     private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
-    private var preferredDDCEndpointByAudioUID: [String: Int] = [:]
+    private var preferredDDCEndpointByAudioUID: [String: Int]
 
     public init(
         audioBackend: AudioBackend = CoreAudioBackend(),
-        ddcBackend: DDCBackend = AppleSiliconDDCBackend()
+        ddcBackend: DDCBackend = AppleSiliconDDCBackend(),
+        store: StateStoreProtocol = FileStateStore()
     ) {
         self.audioBackend = audioBackend
         self.ddcBackend = ddcBackend
+        self.store = store
+        self.preferredDDCEndpointByAudioUID = store.loadState().audioToDDCBindings
     }
 
     public func listOutputDevices() -> [AudioOutputDevice] {
@@ -428,6 +432,8 @@ public final class AudioManager {
             return DDCDisplayEndpoint(
                 index: endpoint.index,
                 name: endpoint.name,
+                serialNumber: endpoint.serialNumber,
+                registryPath: endpoint.registryPath,
                 currentVolume: cachedVol,
                 isMuted: cachedMute
             )
@@ -443,16 +449,22 @@ public final class AudioManager {
     public func currentVolumeSnapshot(readHardwareDDC: Bool = false) -> AudioVolumeSnapshot {
         let devices = audioBackend.listOutputDevices()
         guard let active = devices.first(where: \.isDefault) ?? devices.first else {
-            return AudioVolumeSnapshot(deviceID: nil, volume: 0, isMuted: false, mode: .unsupported)
+            return AudioVolumeSnapshot(deviceID: nil, deviceName: nil, volume: 0, isMuted: false, mode: .unsupported)
         }
 
         if active.supportsCoreAudioVolume {
             let vol = audioBackend.readCoreAudioVolume(deviceID: active.id) ?? 0.5
             let muted = audioBackend.readCoreAudioMuted(deviceID: active.id) ?? false
-            return AudioVolumeSnapshot(deviceID: active.id, volume: vol, isMuted: muted, mode: .coreAudio)
+            return AudioVolumeSnapshot(
+                deviceID: active.id,
+                deviceName: active.name,
+                volume: vol,
+                isMuted: muted,
+                mode: .coreAudio
+            )
         }
 
-        if let endpoint = matchDDCEndpoint(for: active) {
+        if let endpoint = matchDDCEndpoint(for: active, allDevices: devices) {
             let level: Int
             if let cached = cachedDDCVolumes[endpoint.index] {
                 level = cached
@@ -465,13 +477,20 @@ public final class AudioManager {
             let muted = cachedDDCMuted[endpoint.index] ?? false
             return AudioVolumeSnapshot(
                 deviceID: active.id,
+                deviceName: endpoint.name,
                 volume: Double(level) / 100.0,
                 isMuted: muted,
                 mode: .ddc(ddcIndex: endpoint.index, displayName: endpoint.name)
             )
         }
 
-        return AudioVolumeSnapshot(deviceID: active.id, volume: 0, isMuted: false, mode: .unsupported)
+        return AudioVolumeSnapshot(
+            deviceID: active.id,
+            deviceName: active.name,
+            volume: 0,
+            isMuted: false,
+            mode: .unsupported
+        )
     }
 
     @discardableResult
@@ -563,36 +582,67 @@ public final class AudioManager {
 
     public func bindDDCEndpoint(_ endpointIndex: Int, forAudioDeviceUID uid: String) {
         preferredDDCEndpointByAudioUID[uid] = endpointIndex
+        var state = store.loadState()
+        state.audioToDDCBindings = preferredDDCEndpointByAudioUID
+        store.saveState(state)
     }
 
-    private func matchDDCEndpoint(for device: AudioOutputDevice) -> DDCDisplayEndpoint? {
+    private func matchDDCEndpoint(
+        for device: AudioOutputDevice,
+        allDevices: [AudioOutputDevice]
+    ) -> DDCDisplayEndpoint? {
         guard ddcBackend.isAvailable else { return nil }
         let endpoints = ddcBackend.listEndpoints()
         guard !endpoints.isEmpty else { return nil }
 
-        // 0. 优先使用用户手动绑定的 DDC 端点
+        // 0. 优先使用用户手动绑定并持久化的 DDC 端点
         if let preferred = preferredDDCEndpointByAudioUID[device.uid],
            let found = endpoints.first(where: { $0.index == preferred }) {
             return found
         }
 
-        // 1. 名称模糊匹配（忽略大小写与空格/横线，如 "LG HDR 4K" / "LG ULTRAGEAR"）
+        // 1. 硬件标识精准匹配：通过 CoreAudio UID 中的 dispextN 端口路径或显示器序列号对齐
+        let loweredUID = device.uid.lowercased()
+        if let portToken = extractDispExtToken(from: loweredUID),
+           let byPort = endpoints.first(where: { ($0.registryPath?.lowercased().contains(portToken) ?? false) }) {
+            return byPort
+        }
+        if let bySerial = endpoints.first(where: {
+            guard let serial = $0.serialNumber?.lowercased(), serial.count >= 4 else { return false }
+            return loweredUID.contains(serial)
+        }) {
+            return bySerial
+        }
+
+        // 2. 名称模糊匹配：如果命中多个同名端点（如 2 台同型号 LG），按同名音频设备中的序号一一对应，避免永远落到第 0 台
         func normalize(_ text: String) -> String {
             text.lowercased().filter { $0.isLetter || $0.isNumber }
         }
         let normDevice = normalize(device.name)
-        if !normDevice.isEmpty,
-           let exact = endpoints.first(where: {
-               let normEP = normalize($0.name)
-               return !normEP.isEmpty && (normDevice.contains(normEP) || normEP.contains(normDevice))
-           }) {
-            return exact
+        if !normDevice.isEmpty {
+            let matchedEndpoints = endpoints.filter {
+                let normEP = normalize($0.name)
+                return !normEP.isEmpty && (normDevice.contains(normEP) || normEP.contains(normDevice))
+            }
+            if matchedEndpoints.count == 1 {
+                return matchedEndpoints[0]
+            }
+            if matchedEndpoints.count > 1 {
+                let sameNameAudio = allDevices.filter {
+                    !$0.supportsCoreAudioVolume && normalize($0.name) == normDevice
+                }
+                if let pos = sameNameAudio.firstIndex(where: { $0.id == device.id }),
+                   matchedEndpoints.indices.contains(pos) {
+                    return matchedEndpoints[pos]
+                }
+                return matchedEndpoints[0]
+            }
         }
 
-        // 2. 只要该设备不支持 CoreAudio 音量且属于外部直连设备（HDMI/DP/USB/Other），按非 CoreAudio 外接设备顺序兜底映射
+        // 3. 只要该设备不支持 CoreAudio 音量且属于外部直连设备（HDMI/DP/USB/Other），按非 CoreAudio 外接设备顺序兜底映射
         let excludedTransports: Set<AudioTransportType> = [.builtIn, .bluetooth, .airPlay, .virtual]
         if !excludedTransports.contains(device.transport) {
-            let candidates = audioBackend.listOutputDevices().filter {
+            let candidates = allDevices.filter {
                 !$0.supportsCoreAudioVolume && !excludedTransports.contains($0.transport)
             }
             if let pos = candidates.firstIndex(where: { $0.id == device.id }),
@@ -603,5 +653,12 @@ public final class AudioManager {
         }
 
         return nil
+    }
+
+    private func extractDispExtToken(from text: String) -> String? {
+        guard let range = text.range(of: #"dispext\d+"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(text[range])
     }
 }

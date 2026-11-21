@@ -50,19 +50,22 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
     public var disableRules: [String: DisableLayoutRule]
     public var preDisableSnapshots: [String: [DisplayPlacement]]
     public var customNames: [String: String]
+    public var audioToDDCBindings: [String: Int]
 
     public init(
         cachedDisplays: [CachedDisplayRecord] = [],
         presets: [LayoutPreset] = [],
         disableRules: [String: DisableLayoutRule] = [:],
         preDisableSnapshots: [String: [DisplayPlacement]] = [:],
-        customNames: [String: String] = [:]
+        customNames: [String: String] = [:],
+        audioToDDCBindings: [String: Int] = [:]
     ) {
         self.cachedDisplays = cachedDisplays
         self.presets = presets
         self.disableRules = disableRules
         self.preDisableSnapshots = preDisableSnapshots
         self.customNames = customNames
+        self.audioToDDCBindings = audioToDDCBindings
     }
 
     enum CodingKeys: String, CodingKey {
@@ -71,6 +74,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         case disableRules
         case preDisableSnapshots
         case customNames
+        case audioToDDCBindings
     }
 
     public init(from decoder: Decoder) throws {
@@ -80,6 +84,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.disableRules = try container.decodeIfPresent([String: DisableLayoutRule].self, forKey: .disableRules) ?? [:]
         self.preDisableSnapshots = try container.decodeIfPresent([String: [DisplayPlacement]].self, forKey: .preDisableSnapshots) ?? [:]
         self.customNames = try container.decodeIfPresent([String: String].self, forKey: .customNames) ?? [:]
+        self.audioToDDCBindings = try container.decodeIfPresent([String: Int].self, forKey: .audioToDDCBindings) ?? [:]
     }
 }
 

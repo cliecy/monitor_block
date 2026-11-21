@@ -83,7 +83,12 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     public func listEndpoints() -> [DDCDisplayEndpoint] {
         let services = discoverExternalAVServices()
         return services.enumerated().map { idx, item in
-            DDCDisplayEndpoint(index: idx, name: item.name)
+            DDCDisplayEndpoint(
+                index: idx,
+                name: item.name,
+                serialNumber: item.serialNumber,
+                registryPath: item.registryPath
+            )
         }
     }
 
@@ -161,6 +166,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     private struct ResolvedAVService {
         let service: CFTypeRef
         let name: String
+        let serialNumber: String?
+        let registryPath: String?
     }
 
     private func discoverExternalAVServices() -> [ResolvedAVService] {
@@ -196,14 +203,29 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             }
 
             idx += 1
-            let name = resolveDisplayName(from: entry) ?? "外接显示器 #\(idx)"
-            results.append(ResolvedAVService(service: avService, name: name))
+            let meta = resolveDisplayMetadata(from: entry)
+            let name = meta.name ?? "外接显示器 #\(idx)"
+            results.append(
+                ResolvedAVService(
+                    service: avService,
+                    name: name,
+                    serialNumber: meta.serial,
+                    registryPath: resolveRegistryPath(for: entry)
+                )
+            )
         }
 
         return results
     }
 
-    private func resolveDisplayName(from entry: io_registry_entry_t) -> String? {
+    private func resolveRegistryPath(for entry: io_registry_entry_t) -> String? {
+        var pathBuffer = [CChar](repeating: 0, count: 1024)
+        let kr = IORegistryEntryGetPath(entry, kIOServicePlane, &pathBuffer)
+        guard kr == KERN_SUCCESS else { return nil }
+        return String(cString: pathBuffer)
+    }
+
+    private func resolveDisplayMetadata(from entry: io_registry_entry_t) -> (name: String?, serial: String?) {
         var current = entry
         var shouldReleaseCurrent = false
         defer {
@@ -219,10 +241,13 @@ public final class AppleSiliconDDCBackend: DDCBackend {
                 kCFAllocatorDefault,
                 0
             )?.takeRetainedValue() as? [String: Any],
-            let productAttrs = attrs["ProductAttributes"] as? [String: Any],
-            let productName = productAttrs["ProductName"] as? String,
-            !productName.isEmpty {
-                return productName
+            let productAttrs = attrs["ProductAttributes"] as? [String: Any] {
+                let productName = (productAttrs["ProductName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                let alphaSerial = (productAttrs["AlphanumericSerialNumber"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                let numSerial = (productAttrs["SerialNumber"] as? NSNumber)?.stringValue
+                if productName != nil || alphaSerial != nil || numSerial != nil {
+                    return (productName, alphaSerial ?? numSerial)
+                }
             }
 
             var parent: io_registry_entry_t = 0
@@ -236,6 +261,6 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             current = parent
             shouldReleaseCurrent = true
         }
-        return nil
+        return (nil, nil)
     }
 }

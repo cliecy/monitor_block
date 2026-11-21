@@ -70,12 +70,23 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     public var id: Int { index }
     public let index: Int
     public let name: String
+    public let serialNumber: String?
+    public let registryPath: String?
     public let currentVolume: Int?
     public let isMuted: Bool
 
-    public init(index: Int, name: String, currentVolume: Int? = nil, isMuted: Bool = false) {
+    public init(
+        index: Int,
+        name: String,
+        serialNumber: String? = nil,
+        registryPath: String? = nil,
+        currentVolume: Int? = nil,
+        isMuted: Bool = false
+    ) {
         self.index = index
         self.name = name
+        self.serialNumber = serialNumber
+        self.registryPath = registryPath
         self.currentVolume = currentVolume
         self.isMuted = isMuted
     }
@@ -83,17 +94,20 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
 
 public struct AudioVolumeSnapshot: Equatable, Sendable {
     public let deviceID: UInt32?
+    public let deviceName: String?
     public let volume: Double // 0.0 ... 1.0
     public let isMuted: Bool
     public let mode: VolumeControlMode
 
     public init(
         deviceID: UInt32?,
+        deviceName: String? = nil,
         volume: Double,
         isMuted: Bool,
         mode: VolumeControlMode
     ) {
         self.deviceID = deviceID
+        self.deviceName = deviceName
         self.volume = min(max(volume, 0.0), 1.0)
         self.isMuted = isMuted
         self.mode = mode

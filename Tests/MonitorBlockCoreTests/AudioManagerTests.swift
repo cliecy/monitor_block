@@ -94,7 +94,7 @@ struct AudioManagerTests {
         audio.volumes = [10: 0.4, 20: 0.7]
         audio.muted = [10: false, 20: false]
 
-        let manager = AudioManager(audioBackend: audio, ddcBackend: MockDDCBackend())
+        let manager = AudioManager(audioBackend: audio, ddcBackend: MockDDCBackend(), store: InMemoryStateStore())
 
         #expect(manager.selectOutputDevice(id: 20) == true)
         let snap = manager.currentVolumeSnapshot()
@@ -123,7 +123,7 @@ struct AudioManagerTests {
         ]
         ddc.hardwareVolumes = [0: 64]
 
-        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc)
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, store: InMemoryStateStore())
         let snap = manager.currentVolumeSnapshot(readHardwareDDC: true)
 
         #expect(snap.mode == .ddc(ddcIndex: 0, displayName: "LG HDR 4K"))
@@ -145,7 +145,7 @@ struct AudioManagerTests {
         ddc.endpoints = [DDCDisplayEndpoint(index: 0, name: "LG UltraFine")]
         ddc.hardwareVolumes = [0: 55]
 
-        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc)
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, store: InMemoryStateStore())
         _ = manager.currentVolumeSnapshot(readHardwareDDC: true)
 
         // 静音：不发 0x8D=1（避免锁死 LG 固件），直接将 VCP 0x62 置 0
@@ -179,7 +179,7 @@ struct AudioManagerTests {
         ]
         ddc.hardwareVolumes = [0: 30, 1: 80]
 
-        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc)
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, store: InMemoryStateStore())
         let initial = manager.currentVolumeSnapshot(readHardwareDDC: true)
         #expect(initial.mode == .ddc(ddcIndex: 0, displayName: "LG Left"))
         #expect(abs(initial.volume - 0.30) < 0.001)
@@ -189,5 +189,41 @@ struct AudioManagerTests {
         let rebound = manager.currentVolumeSnapshot(readHardwareDDC: true)
         #expect(rebound.mode == .ddc(ddcIndex: 1, displayName: "LG Right"))
         #expect(abs(rebound.volume - 0.80) < 0.001)
+    }
+
+    @Test("两台同型号 LG 显示器分别选择音频输出时，主音量按 dispext 端口/序号精准对应且绑定持久化")
+    func dualIdenticalLGMonitorsMatchCorrectDDCEndpoints() {
+        let store = InMemoryStateStore()
+        let audio = MockAudioBackend()
+        audio.devices = [
+            AudioOutputDevice(id: 31, uid: "AppleDP:dispext1:LG", name: "LG HDR 4K", transport: .displayPort, isDefault: false, supportsCoreAudioVolume: false),
+            AudioOutputDevice(id: 32, uid: "AppleDP:dispext0:LG", name: "LG HDR 4K", transport: .displayPort, isDefault: true, supportsCoreAudioVolume: false)
+        ]
+
+        let ddc = MockDDCBackend()
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "LG HDR 4K", registryPath: "IOService:/.../dispext0/DCPAVServiceProxy"),
+            DDCDisplayEndpoint(index: 1, name: "LG HDR 4K", registryPath: "IOService:/.../dispext1/DCPAVServiceProxy")
+        ]
+        ddc.hardwareVolumes = [0: 25, 1: 75]
+
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, store: store)
+
+        // 当前默认输出是 dispext0（尽管它在数组第 2 位）-> 应精准命中 index 0（音量 25）
+        let snap0 = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(snap0.mode == .ddc(ddcIndex: 0, displayName: "LG HDR 4K"))
+        #expect(abs(snap0.volume - 0.25) < 0.001)
+
+        // 切换到 dispext1 -> 应精准命中 index 1（音量 75）
+        #expect(manager.selectOutputDevice(id: 31) == true)
+        let snap1 = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(snap1.mode == .ddc(ddcIndex: 1, displayName: "LG HDR 4K"))
+        #expect(abs(snap1.volume - 0.75) < 0.001)
+
+        // 手动改绑后重启（新建 AudioManager 共享同一 store）应记住绑定关系
+        manager.bindDDCEndpoint(0, forAudioDeviceUID: "AppleDP:dispext1:LG")
+        let restarted = AudioManager(audioBackend: audio, ddcBackend: ddc, store: store)
+        let afterRestart = restarted.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(afterRestart.mode == .ddc(ddcIndex: 0, displayName: "LG HDR 4K"))
     }
 }
