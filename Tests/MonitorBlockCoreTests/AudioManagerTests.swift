@@ -164,4 +164,30 @@ struct AudioManagerTests {
         #expect(ddc.setMuteCalls.last?.muted == false)
         #expect(ddc.setVolumeCalls.last?.volume == 42)
     }
+
+    @Test("USB/扩展坞上报的外接屏音频设备自动兜底匹配 DDC 并支持手动切换绑定")
+    func usbExternalDisplayAudioFallbackAndManualBinding() {
+        let audio = MockAudioBackend()
+        audio.devices = [
+            AudioOutputDevice(id: 40, uid: "dock-lg", name: "USB-C Dock Audio", transport: .usb, isDefault: true, supportsCoreAudioVolume: false)
+        ]
+
+        let ddc = MockDDCBackend()
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "LG Left"),
+            DDCDisplayEndpoint(index: 1, name: "LG Right")
+        ]
+        ddc.hardwareVolumes = [0: 30, 1: 80]
+
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc)
+        let initial = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(initial.mode == .ddc(ddcIndex: 0, displayName: "LG Left"))
+        #expect(abs(initial.volume - 0.30) < 0.001)
+
+        // 手动改绑到第二台 LG
+        manager.bindDDCEndpoint(1, forAudioDeviceUID: "dock-lg")
+        let rebound = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(rebound.mode == .ddc(ddcIndex: 1, displayName: "LG Right"))
+        #expect(abs(rebound.volume - 0.80) < 0.001)
+    }
 }

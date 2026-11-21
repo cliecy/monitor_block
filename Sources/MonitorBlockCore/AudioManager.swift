@@ -407,6 +407,7 @@ public final class AudioManager {
     private var cachedDDCVolumes: [Int: Int] = [:]
     private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
+    private var preferredDDCEndpointByAudioUID: [String: Int] = [:]
 
     public init(
         audioBackend: AudioBackend = CoreAudioBackend(),
@@ -560,24 +561,41 @@ public final class AudioManager {
         audioBackend.stopObservingChanges()
     }
 
+    public func bindDDCEndpoint(_ endpointIndex: Int, forAudioDeviceUID uid: String) {
+        preferredDDCEndpointByAudioUID[uid] = endpointIndex
+    }
+
     private func matchDDCEndpoint(for device: AudioOutputDevice) -> DDCDisplayEndpoint? {
         guard ddcBackend.isAvailable else { return nil }
         let endpoints = ddcBackend.listEndpoints()
         guard !endpoints.isEmpty else { return nil }
 
-        // 1. 优先按名称包含匹配（如 "LG HDR 4K" / "DELL U2723QE"）
-        let loweredDevice = device.name.lowercased()
-        if let exact = endpoints.first(where: {
-            let epName = $0.name.lowercased()
-            return loweredDevice.contains(epName) || epName.contains(loweredDevice)
-        }) {
+        // 0. 优先使用用户手动绑定的 DDC 端点
+        if let preferred = preferredDDCEndpointByAudioUID[device.uid],
+           let found = endpoints.first(where: { $0.index == preferred }) {
+            return found
+        }
+
+        // 1. 名称模糊匹配（忽略大小写与空格/横线，如 "LG HDR 4K" / "LG ULTRAGEAR"）
+        func normalize(_ text: String) -> String {
+            text.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        let normDevice = normalize(device.name)
+        if !normDevice.isEmpty,
+           let exact = endpoints.first(where: {
+               let normEP = normalize($0.name)
+               return !normEP.isEmpty && (normDevice.contains(normEP) || normEP.contains(normDevice))
+           }) {
             return exact
         }
 
-        // 2. 如果是 HDMI / DisplayPort 输出设备，按外接音频设备顺序映射
-        if device.transport.isExternalDisplayAudio {
-            let externalAudioDevices = audioBackend.listOutputDevices().filter { $0.transport.isExternalDisplayAudio }
-            if let pos = externalAudioDevices.firstIndex(where: { $0.id == device.id }),
+        // 2. 只要该设备不支持 CoreAudio 音量且属于外部直连设备（HDMI/DP/USB/Other），按非 CoreAudio 外接设备顺序兜底映射
+        let excludedTransports: Set<AudioTransportType> = [.builtIn, .bluetooth, .airPlay, .virtual]
+        if !excludedTransports.contains(device.transport) {
+            let candidates = audioBackend.listOutputDevices().filter {
+                !$0.supportsCoreAudioVolume && !excludedTransports.contains($0.transport)
+            }
+            if let pos = candidates.firstIndex(where: { $0.id == device.id }),
                endpoints.indices.contains(pos) {
                 return endpoints[pos]
             }

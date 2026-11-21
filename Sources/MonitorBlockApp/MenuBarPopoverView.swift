@@ -12,8 +12,8 @@ final class MenuBarPopoverViewModel: ObservableObject {
     @Published var volume: Double = 0.5
     @Published var isMuted: Bool = false
     @Published var volumeMode: VolumeControlMode = .unsupported
-    @Published var showExternalDDCList: Bool = false
     @Published var ddcVolumes: [Int: Double] = [:]
+    @Published var ddcMuted: [Int: Bool] = [:]
 
     @Published var launchAtLoginEnabled: Bool = false
     @Published var autoRestoreOnQuit: Bool = true
@@ -77,6 +77,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
             } else if ddcVolumes[ep.index] == nil {
                 ddcVolumes[ep.index] = 0.5
             }
+            ddcMuted[ep.index] = ep.isMuted
         }
     }
 
@@ -187,14 +188,21 @@ final class MenuBarPopoverViewModel: ObservableObject {
         isMuted = snap.isMuted
         if case .ddc(let idx, _) = snap.mode {
             ddcVolumes[idx] = snap.volume
+            ddcMuted[idx] = snap.isMuted
         }
     }
 
     func updateDDCVolume(endpointIndex: Int, value: Double) {
         let clamped = min(max(value, 0.0), 1.0)
         ddcVolumes[endpointIndex] = clamped
+        if clamped > 0.001 {
+            ddcMuted[endpointIndex] = false
+        }
         if case .ddc(let currentIdx, _) = volumeMode, currentIdx == endpointIndex {
             volume = clamped
+            if clamped > 0.001 {
+                isMuted = false
+            }
         }
 
         pendingDDCWorkItems[endpointIndex]?.cancel()
@@ -204,6 +212,25 @@ final class MenuBarPopoverViewModel: ObservableObject {
         }
         pendingDDCWorkItems[endpointIndex] = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.07, execute: work)
+    }
+
+    func toggleDDCMute(endpointIndex: Int) {
+        let nextMuted = !(ddcMuted[endpointIndex] ?? false)
+        _ = audioManager.setDDCMuted(nextMuted, endpointIndex: endpointIndex)
+        refresh(readHardwareDDC: false)
+    }
+
+    func bindActiveAudioToDDC(endpointIndex: Int) {
+        guard let active = audioDevices.first(where: \.isDefault) else { return }
+        audioManager.bindDDCEndpoint(endpointIndex, forAudioDeviceUID: active.uid)
+        refresh(readHardwareDDC: true)
+    }
+
+    var activeDDCEndpointIndex: Int? {
+        if case .ddc(let idx, _) = volumeMode {
+            return idx
+        }
+        return nil
     }
 
     // MARK: - App Actions
@@ -454,35 +481,105 @@ struct MenuBarPopoverView: View {
                 }
             }
 
-            // 主音量控制滑块
-            HStack(spacing: 8) {
-                Button {
-                    viewModel.toggleMainMute()
-                } label: {
-                    Image(systemName: volumeSymbol(level: viewModel.volume, muted: viewModel.isMuted))
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundColor(viewModel.isMuted ? .secondary : .accentColor)
-                        .frame(width: 24, height: 24)
+            // 主音量控制滑块（CoreAudio 或自动绑定的外接屏 DDC 音量）
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    Button {
+                        viewModel.toggleMainMute()
+                    } label: {
+                        Image(systemName: volumeSymbol(level: viewModel.volume, muted: viewModel.isMuted))
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(viewModel.isMuted ? .secondary : .accentColor)
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(viewModel.volumeMode == .unsupported)
+
+                    Slider(
+                        value: Binding(
+                            get: { viewModel.isMuted ? 0 : viewModel.volume },
+                            set: { viewModel.updateMainVolume($0) }
+                        ),
+                        in: 0...1
+                    )
+                    .disabled(viewModel.volumeMode == .unsupported)
+
+                    Text(viewModel.volumeMode == .unsupported ? "--" : "\(Int((viewModel.isMuted ? 0 : viewModel.volume * 100).rounded()))%")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(width: 34, alignment: .trailing)
                 }
-                .buttonStyle(.plain)
-                .disabled(viewModel.volumeMode == .unsupported)
 
-                Slider(
-                    value: Binding(
-                        get: { viewModel.isMuted ? 0 : viewModel.volume },
-                        set: { viewModel.updateMainVolume($0) }
-                    ),
-                    in: 0...1
-                )
-                .disabled(viewModel.volumeMode == .unsupported)
+                // 直接在主音量下方整合显示所有外接屏 DDC 音量（无需折叠展开，每台自带独立静音 + 滑块）
+                if !viewModel.ddcEndpoints.isEmpty {
+                    let endpointsToShow: [DDCDisplayEndpoint] = {
+                        // 如果只有 1 台外接屏且主音量已经在控制它，无需重复显示两行相同滑块
+                        if viewModel.ddcEndpoints.count == 1,
+                           viewModel.activeDDCEndpointIndex == viewModel.ddcEndpoints[0].index {
+                            return []
+                        }
+                        return viewModel.ddcEndpoints
+                    }()
 
-                Text(viewModel.volumeMode == .unsupported ? "--" : "\(Int((viewModel.isMuted ? 0 : viewModel.volume * 100).rounded()))%")
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(.secondary)
-                    .frame(width: 34, alignment: .trailing)
+                    if !endpointsToShow.isEmpty {
+                        Divider()
+                            .padding(.vertical, 1)
+
+                        ForEach(endpointsToShow) { ep in
+                            let epVol = viewModel.ddcVolumes[ep.index] ?? 0.5
+                            let epMuted = viewModel.ddcMuted[ep.index] ?? false
+                            let isLinkedToMain = (viewModel.activeDDCEndpointIndex == ep.index)
+
+                            HStack(spacing: 6) {
+                                Button {
+                                    viewModel.toggleDDCMute(endpointIndex: ep.index)
+                                } label: {
+                                    Image(systemName: volumeSymbol(level: epVol, muted: epMuted))
+                                        .font(.system(size: 12))
+                                        .foregroundColor(epMuted ? .secondary : .teal)
+                                        .frame(width: 20, height: 20)
+                                }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    if viewModel.activeDDCEndpointIndex != nil {
+                                        viewModel.bindActiveAudioToDDC(endpointIndex: ep.index)
+                                    }
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        Text("\(ep.name)")
+                                            .font(.system(size: 11, weight: isLinkedToMain ? .semibold : .regular))
+                                            .lineLimit(1)
+                                        if isLinkedToMain {
+                                            Image(systemName: "link")
+                                                .font(.system(size: 9))
+                                                .foregroundColor(.teal)
+                                        }
+                                    }
+                                    .frame(width: 94, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
+                                .help(viewModel.activeDDCEndpointIndex != nil ? "点击将当前输出主音量绑定到此显示器" : ep.name)
+
+                                Slider(
+                                    value: Binding(
+                                        get: { epMuted ? 0 : epVol },
+                                        set: { viewModel.updateDDCVolume(endpointIndex: ep.index, value: $0) }
+                                    ),
+                                    in: 0...1
+                                )
+
+                                Text("\(Int((epMuted ? 0 : epVol * 100).rounded()))%")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 30, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 6)
+            .padding(.vertical, 7)
             .background(Color.primary.opacity(0.035))
             .cornerRadius(8)
 
@@ -492,51 +589,6 @@ struct MenuBarPopoverView: View {
                     ForEach(viewModel.audioDevices) { device in
                         audioDeviceRow(device)
                     }
-                }
-            }
-
-            // 如果存在支持 DDC/CI 的外接显示器，提供可展开的独立外接屏硬件音量区
-            if !viewModel.ddcEndpoints.isEmpty {
-                Divider()
-                    .padding(.vertical, 2)
-
-                Button {
-                    viewModel.showExternalDDCList.toggle()
-                } label: {
-                    HStack {
-                        Image(systemName: viewModel.showExternalDDCList ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 10, weight: .semibold))
-                        Text("独立调节外接屏 DDC/CI 音量（\(viewModel.ddcEndpoints.count) 台）")
-                            .font(.system(size: 11, weight: .medium))
-                        Spacer()
-                    }
-                    .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-
-                if viewModel.showExternalDDCList {
-                    VStack(spacing: 6) {
-                        ForEach(viewModel.ddcEndpoints) { ep in
-                            HStack(spacing: 8) {
-                                Text(ep.name)
-                                    .font(.system(size: 11))
-                                    .lineLimit(1)
-                                    .frame(width: 96, alignment: .leading)
-                                Slider(
-                                    value: Binding(
-                                        get: { viewModel.ddcVolumes[ep.index] ?? 0.5 },
-                                        set: { viewModel.updateDDCVolume(endpointIndex: ep.index, value: $0) }
-                                    ),
-                                    in: 0...1
-                                )
-                                Text("\(Int(((viewModel.ddcVolumes[ep.index] ?? 0.5) * 100).rounded()))%")
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 32, alignment: .trailing)
-                            }
-                        }
-                    }
-                    .padding(.top, 2)
                 }
             }
         }
