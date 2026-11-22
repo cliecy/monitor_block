@@ -9,6 +9,10 @@ final class MenuBarPopoverViewModel: ObservableObject {
     @Published var presets: [LayoutPreset] = []
     @Published var audioDevices: [AudioOutputDevice] = []
     @Published var ddcEndpoints: [DDCDisplayEndpoint] = []
+    @Published var displayToDDCIndex: [String: Int] = [:] // display.uuid -> ddcEndpoint.index
+    @Published var inputStatuses: [Int: DisplayInputStatus] = [:] // ddcEndpoint.index -> status
+    @Published var switchingInputs: [Int: DisplayInputSource] = [:] // ddcEndpoint.index -> switching target
+
     @Published var volume: Double = 0.5
     @Published var isMuted: Bool = false
     @Published var volumeMode: VolumeControlMode = .unsupported
@@ -20,7 +24,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
     @Published var launchAtLoginEnabled: Bool = false
     @Published var autoRestoreOnQuit: Bool = true
     @Published var isPrivateAPIAvailable: Bool = true
-    @Published var errorBanner: String?
+    @Published var statusBanner: (text: String, isError: Bool)?
 
     private let displayManager: DisplayManager
     private let audioManager: AudioManager
@@ -35,6 +39,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
 
     private var pendingVolumeWorkItem: DispatchWorkItem?
     private var pendingDDCWorkItems: [Int: DispatchWorkItem] = [:]
+    private var bannerClearWorkItem: DispatchWorkItem?
 
     init(
         displayManager: DisplayManager,
@@ -80,6 +85,14 @@ final class MenuBarPopoverViewModel: ObservableObject {
         volumeTargetName = snapshot.deviceName
 
         ddcEndpoints = audioManager.listDDCEndpoints()
+        var mapping: [String: Int] = [:]
+        for display in displays where !display.isBuiltin && display.isActive {
+            if let ep = audioManager.matchDDCEndpoint(for: display, allDisplays: displays, endpoints: ddcEndpoints) {
+                mapping[display.uuid] = ep.index
+            }
+        }
+        displayToDDCIndex = mapping
+
         for ep in ddcEndpoints {
             if let vol = ep.currentVolume {
                 ddcVolumes[ep.index] = Double(vol) / 100.0
@@ -87,6 +100,43 @@ final class MenuBarPopoverViewModel: ObservableObject {
                 ddcVolumes[ep.index] = 0.5
             }
             ddcMuted[ep.index] = ep.isMuted
+            if let cachedStatus = audioManager.cachedDisplayInputStatus(endpointIndex: ep.index) {
+                inputStatuses[ep.index] = cachedStatus
+            }
+        }
+
+        if readHardwareDDC {
+            refreshAllInputStatusesAsync()
+        }
+    }
+
+    func refreshAllInputStatusesAsync() {
+        let indices = ddcEndpoints.map(\.index)
+        guard !indices.isEmpty else { return }
+        let audioMgr = audioManager
+
+        Task.detached(priority: .userInitiated) {
+            var results: [Int: DisplayInputStatus] = [:]
+            for idx in indices {
+                results[idx] = audioMgr.readDisplayInputStatus(endpointIndex: idx)
+            }
+            let finalResults = results
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                for (idx, status) in finalResults {
+                    self.inputStatuses[idx] = status
+                }
+            }
+        }
+    }
+
+    func refreshSingleInputStatusAsync(endpointIndex: Int) {
+        let audioMgr = audioManager
+        Task.detached(priority: .userInitiated) {
+            let status = audioMgr.readDisplayInputStatus(endpointIndex: endpointIndex)
+            await MainActor.run { [weak self] in
+                self?.inputStatuses[endpointIndex] = status
+            }
         }
     }
 
@@ -105,36 +155,36 @@ final class MenuBarPopoverViewModel: ObservableObject {
     // MARK: - Display Actions
 
     func setDisplay(_ display: DisplayInfo, enabled: Bool) {
-        errorBanner = nil
+        clearBanner()
         do {
             try displayManager.setDisplay(id: display.id, enabled: enabled)
             refresh(readHardwareDDC: false)
             onStatusChanged()
         } catch {
-            errorBanner = error.localizedDescription
+            showBanner(error.localizedDescription, isError: true)
             refresh(readHardwareDDC: false)
         }
     }
 
     func disableAllExternal() {
-        errorBanner = nil
+        clearBanner()
         do {
             try displayManager.disableAllExternal()
             refresh(readHardwareDDC: false)
             onStatusChanged()
         } catch {
-            errorBanner = error.localizedDescription
+            showBanner(error.localizedDescription, isError: true)
         }
     }
 
     func enableAllDisplays() {
-        errorBanner = nil
+        clearBanner()
         do {
             try displayManager.enableAllDisplays()
             refresh(readHardwareDDC: false)
             onStatusChanged()
         } catch {
-            errorBanner = error.localizedDescription
+            showBanner(error.localizedDescription, isError: true)
         }
     }
 
@@ -143,24 +193,98 @@ final class MenuBarPopoverViewModel: ObservableObject {
     }
 
     func applyPreset(_ preset: LayoutPreset) {
-        errorBanner = nil
+        clearBanner()
         do {
             try displayManager.applyPreset(id: preset.id)
+            showBanner("已切换布局预设「\(preset.name)」", isError: false)
             refresh(readHardwareDDC: false)
             onStatusChanged()
         } catch {
-            errorBanner = error.localizedDescription
+            showBanner(error.localizedDescription, isError: true)
         }
+    }
+
+    // MARK: - Input Source Actions (Async, Non-blocking)
+
+    func setInputProtocolMode(_ mode: InputSourceProtocolMode) {
+        inputProtocolMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: Self.inputProtocolKey)
+        showBanner("输入源协议已切换为：\(mode.label)", isError: false)
+    }
+
+    func switchInputSource(_ source: DisplayInputSource, endpointIndex: Int, displayName: String) {
+        switchingInputs[endpointIndex] = source
+        showBanner("正在将「\(displayName)」切换至 \(source.label)…", isError: false, autoClear: false)
+
+        let audioMgr = audioManager
+        let mode = inputProtocolMode
+
+        Task.detached(priority: .userInitiated) {
+            let ok = audioMgr.setDisplayInputSource(source, endpointIndex: endpointIndex, protocolMode: mode)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.switchingInputs.removeValue(forKey: endpointIndex)
+                if ok {
+                    // 立即在 UI 上先更新激活高亮，给用户明确的切换反馈
+                    let existing = self.inputStatuses[endpointIndex]
+                    self.inputStatuses[endpointIndex] = DisplayInputStatus(
+                        activeSource: source,
+                        rawRead: existing?.rawRead ?? DDCInputReadResult(),
+                        calibratedCodes: existing?.calibratedCodes ?? [:]
+                    )
+                    self.showBanner("已发送信号源切换：\(displayName) → \(source.label)", isError: false)
+                } else {
+                    self.showBanner("「\(displayName)」切换至 \(source.label) 失败，可点击右侧 ⚙︎ 校准该端口。", isError: true)
+                }
+            }
+
+            // 等待显示器完成握手后重新回读真实硬件状态
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let updatedStatus = audioMgr.readDisplayInputStatus(endpointIndex: endpointIndex)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if updatedStatus.activeSource != nil || !updatedStatus.rawRead.isEmpty {
+                    self.inputStatuses[endpointIndex] = updatedStatus
+                }
+            }
+        }
+    }
+
+    func calibrateCurrentInput(as source: DisplayInputSource, endpointIndex: Int, displayName: String) {
+        showBanner("正在读取「\(displayName)」当前端口硬件码…", isError: false, autoClear: false)
+        let audioMgr = audioManager
+
+        Task.detached(priority: .userInitiated) {
+            let code = audioMgr.calibrateCurrentInputSource(as: source, endpointIndex: endpointIndex)
+            let refreshed = audioMgr.cachedDisplayInputStatus(endpointIndex: endpointIndex)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if let refreshed {
+                    self.inputStatuses[endpointIndex] = refreshed
+                }
+                if let code {
+                    self.showBanner("校准成功：「\(displayName)」的 \(source.label) 已绑定为 \(code.hexSummary)", isError: false)
+                } else {
+                    self.showBanner("未能从「\(displayName)」读出当前端口码，请确认线缆支持 DDC/CI。", isError: true)
+                }
+            }
+        }
+    }
+
+    func resetInputCalibration(endpointIndex: Int, displayName: String) {
+        audioManager.resetInputCalibration(endpointIndex: endpointIndex)
+        refreshSingleInputStatusAsync(endpointIndex: endpointIndex)
+        showBanner("已重置「\(displayName)」的输入源校准", isError: false)
     }
 
     // MARK: - Audio Actions
 
     func selectAudioOutput(_ device: AudioOutputDevice) {
-        errorBanner = nil
+        clearBanner()
         if audioManager.selectOutputDevice(id: device.id) {
             refresh(readHardwareDDC: true)
         } else {
-            errorBanner = "切换音频输出设备「\(device.name)」失败。"
+            showBanner("切换音频输出设备「\(device.name)」失败。", isError: true)
         }
     }
 
@@ -171,15 +295,20 @@ final class MenuBarPopoverViewModel: ObservableObject {
             isMuted = false
         }
 
-        // CoreAudio 直接即时写入；DDC/CI 走 70ms 节流避免 I2C 拥塞
         switch volumeMode {
         case .coreAudio:
             _ = audioManager.setCurrentVolume(clamped)
         case .ddc(let idx, _):
             ddcVolumes[idx] = clamped
+            if clamped > 0.001 {
+                ddcMuted[idx] = false
+            }
             pendingVolumeWorkItem?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                _ = self?.audioManager.setCurrentVolume(clamped)
+            let audioMgr = audioManager
+            let work = DispatchWorkItem {
+                Task.detached(priority: .userInitiated) {
+                    _ = audioMgr.setCurrentVolume(clamped)
+                }
             }
             pendingVolumeWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.07, execute: work)
@@ -191,13 +320,27 @@ final class MenuBarPopoverViewModel: ObservableObject {
     func toggleMainMute() {
         let nextMuted = !isMuted
         isMuted = nextMuted
-        _ = audioManager.setCurrentMuted(nextMuted)
-        let snap = audioManager.currentVolumeSnapshot(readHardwareDDC: false)
-        volume = snap.volume
-        isMuted = snap.isMuted
-        if case .ddc(let idx, _) = snap.mode {
-            ddcVolumes[idx] = snap.volume
-            ddcMuted[idx] = snap.isMuted
+        let audioMgr = audioManager
+
+        if case .coreAudio = volumeMode {
+            _ = audioMgr.setCurrentMuted(nextMuted)
+            let snap = audioMgr.currentVolumeSnapshot(readHardwareDDC: false)
+            volume = snap.volume
+            isMuted = snap.isMuted
+        } else {
+            Task.detached(priority: .userInitiated) {
+                _ = audioMgr.setCurrentMuted(nextMuted)
+                let snap = audioMgr.currentVolumeSnapshot(readHardwareDDC: false)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.volume = snap.volume
+                    self.isMuted = snap.isMuted
+                    if case .ddc(let idx, _) = snap.mode {
+                        self.ddcVolumes[idx] = snap.volume
+                        self.ddcMuted[idx] = snap.isMuted
+                    }
+                }
+            }
         }
     }
 
@@ -215,9 +358,12 @@ final class MenuBarPopoverViewModel: ObservableObject {
         }
 
         pendingDDCWorkItems[endpointIndex]?.cancel()
-        let work = DispatchWorkItem { [weak self] in
+        let audioMgr = audioManager
+        let work = DispatchWorkItem {
             let percent = Int((clamped * 100.0).rounded())
-            _ = self?.audioManager.setDDCVolume(percent, endpointIndex: endpointIndex)
+            Task.detached(priority: .userInitiated) {
+                _ = audioMgr.setDDCVolume(percent, endpointIndex: endpointIndex)
+            }
         }
         pendingDDCWorkItems[endpointIndex] = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.07, execute: work)
@@ -225,31 +371,20 @@ final class MenuBarPopoverViewModel: ObservableObject {
 
     func toggleDDCMute(endpointIndex: Int) {
         let nextMuted = !(ddcMuted[endpointIndex] ?? false)
-        _ = audioManager.setDDCMuted(nextMuted, endpointIndex: endpointIndex)
-        refresh(readHardwareDDC: false)
+        ddcMuted[endpointIndex] = nextMuted
+        let audioMgr = audioManager
+        Task.detached(priority: .userInitiated) {
+            _ = audioMgr.setDDCMuted(nextMuted, endpointIndex: endpointIndex)
+            await MainActor.run { [weak self] in
+                self?.refresh(readHardwareDDC: false)
+            }
+        }
     }
 
     func bindActiveAudioToDDC(endpointIndex: Int) {
         guard let active = audioDevices.first(where: \.isDefault) else { return }
         audioManager.bindDDCEndpoint(endpointIndex, forAudioDeviceUID: active.uid)
         refresh(readHardwareDDC: true)
-    }
-
-    func cycleInputProtocolMode() {
-        inputProtocolMode = inputProtocolMode.next
-        UserDefaults.standard.set(inputProtocolMode.rawValue, forKey: Self.inputProtocolKey)
-    }
-
-    func switchInputSource(_ source: DisplayInputSource, endpointIndex: Int) {
-        errorBanner = nil
-        let ok = audioManager.setDisplayInputSource(
-            source,
-            endpointIndex: endpointIndex,
-            protocolMode: inputProtocolMode
-        )
-        if !ok {
-            errorBanner = "发送切换输入源指令（\(source.label)）失败，可尝试点击右上角切换「标准 0x60 / LG 0xF4」协议模式。"
-        }
     }
 
     var activeDDCEndpointIndex: Int? {
@@ -259,7 +394,6 @@ final class MenuBarPopoverViewModel: ObservableObject {
         return nil
     }
 
-    /// 为同名音频输出设备（如两台 LG HDR 4K）生成带 #1 / #2 区分后缀的显示名
     func displayTitle(for device: AudioOutputDevice) -> String {
         let sameName = audioDevices.filter { $0.name == device.name }
         guard sameName.count > 1,
@@ -269,8 +403,12 @@ final class MenuBarPopoverViewModel: ObservableObject {
         return "\(device.name) #\(idx + 1)"
     }
 
-    /// 为同名 DDC 端点生成带 #1 / #2 区分后缀的显示名
+    /// 优先返回用户为对应显示器设置的自定义名称（如“左 LG”），避免出现难以区分的 #1/#2
     func displayTitle(for endpoint: DDCDisplayEndpoint) -> String {
+        if let matchedUUID = displayToDDCIndex.first(where: { $0.value == endpoint.index })?.key,
+           let matchedDisplay = displays.first(where: { $0.uuid == matchedUUID }) {
+            return matchedDisplay.name
+        }
         let sameName = ddcEndpoints.filter { $0.name == endpoint.name }
         guard sameName.count > 1,
               let idx = sameName.firstIndex(where: { $0.index == endpoint.index }) else {
@@ -282,12 +420,12 @@ final class MenuBarPopoverViewModel: ObservableObject {
     // MARK: - App Actions
 
     func toggleLaunchAtLogin() {
-        errorBanner = nil
+        clearBanner()
         do {
             try launchAtLogin.setEnabled(!launchAtLogin.isEnabled)
             launchAtLoginEnabled = launchAtLogin.isEnabled
         } catch {
-            errorBanner = error.localizedDescription
+            showBanner(error.localizedDescription, isError: true)
         }
     }
 
@@ -306,6 +444,24 @@ final class MenuBarPopoverViewModel: ObservableObject {
     func quitApp() {
         onQuit()
     }
+
+    // MARK: - Banner Helpers
+
+    private func showBanner(_ text: String, isError: Bool, autoClear: Bool = true) {
+        bannerClearWorkItem?.cancel()
+        statusBanner = (text, isError)
+        guard autoClear else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.statusBanner = nil
+        }
+        bannerClearWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (isError ? 5.0 : 3.2), execute: work)
+    }
+
+    func clearBanner() {
+        bannerClearWorkItem?.cancel()
+        statusBanner = nil
+    }
 }
 
 // MARK: - Control Center Popover View
@@ -317,24 +473,25 @@ struct MenuBarPopoverView: View {
         VStack(spacing: 10) {
             headerBar
 
-            if let error = viewModel.errorBanner {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                    Text(error)
+            if let banner = viewModel.statusBanner {
+                HStack(alignment: .center, spacing: 6) {
+                    Image(systemName: banner.isError ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundColor(banner.isError ? .orange : .accentColor)
+                    Text(banner.text)
                         .font(.caption)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer()
                     Button {
-                        viewModel.errorBanner = nil
+                        viewModel.clearBanner()
                     } label: {
                         Image(systemName: "xmark")
                             .font(.caption2)
                     }
                     .buttonStyle(.plain)
                 }
-                .padding(8)
-                .background(Color.orange.opacity(0.14))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 7)
+                .background((banner.isError ? Color.orange : Color.accentColor).opacity(0.14))
                 .cornerRadius(8)
             }
 
@@ -342,7 +499,7 @@ struct MenuBarPopoverView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.circle.fill")
                         .foregroundColor(.red)
-                    Text("当前系统不支持软断开 API，仅支持布局与音频控制。")
+                    Text("当前系统不支持软断开 API，仅支持布局、输入源与音频控制。")
                         .font(.caption)
                 }
                 .padding(8)
@@ -354,19 +511,16 @@ struct MenuBarPopoverView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
                     displaysCard
-                    if !viewModel.ddcEndpoints.isEmpty {
-                        inputSourceCard
-                    }
                     audioCard
                     presetsCard
                 }
             }
-            .frame(maxHeight: 520)
+            .frame(maxHeight: 540)
 
             footerBar
         }
         .padding(12)
-        .frame(width: 364)
+        .frame(width: 376)
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.65))
     }
 
@@ -391,7 +545,7 @@ struct MenuBarPopoverView: View {
             headerIconButton(symbol: "rectangle.3.group", help: "命名、布局与关闭规则设置") {
                 viewModel.openLayoutEditor()
             }
-            headerIconButton(symbol: "arrow.clockwise", help: "刷新状态") {
+            headerIconButton(symbol: "arrow.clockwise", help: "刷新显示器、输入源与音频状态") {
                 viewModel.refresh(readHardwareDDC: true)
             }
         }
@@ -409,12 +563,12 @@ struct MenuBarPopoverView: View {
         .help(help)
     }
 
-    // MARK: - Displays Card
+    // MARK: - Displays Card (含内嵌输入源切换条)
 
     private var displaysCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("显示器", systemImage: "display.2")
+                Label("显示器与信号源", systemImage: "display.2")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.secondary)
                 Spacer()
@@ -442,7 +596,7 @@ struct MenuBarPopoverView: View {
                     .foregroundColor(.secondary)
                     .padding(.vertical, 6)
             } else {
-                VStack(spacing: 6) {
+                VStack(spacing: 7) {
                     ForEach(viewModel.displays) { display in
                         displayRow(display)
                     }
@@ -454,107 +608,177 @@ struct MenuBarPopoverView: View {
     }
 
     private func displayRow(_ display: DisplayInfo) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: display.isBuiltin ? "laptopcomputer" : "display")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundColor(display.isActive ? .accentColor : .secondary)
-                .frame(width: 22)
+        let ddcIndex = viewModel.displayToDDCIndex[display.uuid]
 
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
-                    Text(display.name)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .lineLimit(1)
-                    if display.isMain {
-                        tagBadge("主屏", color: .accentColor)
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Image(systemName: display.isBuiltin ? "laptopcomputer" : "display")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(display.isActive ? .accentColor : .secondary)
+                    .frame(width: 22)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(display.name)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .lineLimit(1)
+                        if display.isMain {
+                            tagBadge("主屏", color: .accentColor)
+                        }
+                        if display.isBuiltin {
+                            tagBadge("内置", color: .secondary)
+                        }
+                        if viewModel.hasDisableRule(for: display.uuid) {
+                            tagBadge("规则", color: .purple)
+                        }
                     }
-                    if display.isBuiltin {
-                        tagBadge("内置", color: .secondary)
-                    }
-                    if viewModel.hasDisableRule(for: display.uuid) {
-                        tagBadge("规则", color: .purple)
+
+                    HStack(spacing: 6) {
+                        if let res = display.resolutionText {
+                            Text(res)
+                                .font(.system(size: 10.5))
+                                .foregroundColor(.secondary)
+                        }
+                        if !display.isActive {
+                            Text("已停用")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.orange)
+                        } else if let idx = ddcIndex,
+                                  let activeSrc = viewModel.inputStatuses[idx]?.activeSource {
+                            Text("当前：\(activeSrc.label)")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.accentColor)
+                        }
                     }
                 }
 
-                HStack(spacing: 6) {
-                    if let res = display.resolutionText {
-                        Text(res)
-                            .font(.system(size: 10.5))
-                            .foregroundColor(.secondary)
-                    }
-                    if !display.isActive {
-                        Text("已停用")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundColor(.orange)
-                    }
-                }
+                Spacer()
+
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { display.isActive },
+                        set: { viewModel.setDisplay(display, enabled: $0) }
+                    )
+                )
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
             }
 
-            Spacer()
-
-            Toggle(
-                "",
-                isOn: Binding(
-                    get: { display.isActive },
-                    set: { viewModel.setDisplay(display, enabled: $0) }
-                )
-            )
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .labelsHidden()
+            // 内嵌该外接显示器的信号输入源切换条（自动高亮当前激活输入源 + 校准菜单）
+            if display.isActive, let idx = ddcIndex {
+                inputSourceStrip(endpointIndex: idx, displayName: display.name)
+            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        .background(Color.primary.opacity(0.035))
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(Color.primary.opacity(0.038))
         .cornerRadius(8)
     }
 
-    // MARK: - Input Source Card
+    private func inputSourceStrip(endpointIndex: Int, displayName: String) -> some View {
+        let status = viewModel.inputStatuses[endpointIndex]
+        let activeSource = status?.activeSource
+        let switchingTarget = viewModel.switchingInputs[endpointIndex]
 
-    private var inputSourceCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Label("信号输入源", systemImage: "cable.connector.horizontal")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button {
-                    viewModel.cycleInputProtocolMode()
-                } label: {
-                    tagBadge(viewModel.inputProtocolMode.label, color: .indigo)
+        return HStack(spacing: 4) {
+            HStack(spacing: 3) {
+                ForEach(DisplayInputSource.allCases) { source in
+                    let isSelected = (switchingTarget == source) || (switchingTarget == nil && activeSource == source)
+                    let isSwitchingThis = (switchingTarget == source)
+                    let isCalibrated = (status?.calibratedCodes[source] != nil)
+
+                    Button {
+                        viewModel.switchInputSource(source, endpointIndex: endpointIndex, displayName: displayName)
+                    } label: {
+                        HStack(spacing: 2) {
+                            if isSwitchingThis {
+                                ProgressView()
+                                    .controlSize(.mini)
+                                    .scaleEffect(0.65)
+                            }
+                            Text(source.label)
+                                .font(.system(size: 10, weight: isSelected ? .semibold : .medium))
+                                .lineLimit(1)
+                            if isCalibrated && !isSwitchingThis {
+                                Circle()
+                                    .fill(isSelected ? Color.white : Color.teal)
+                                    .frame(width: 4, height: 4)
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: .infinity)
+                        .foregroundColor(isSelected ? .white : .primary)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(isSelected ? Color.accentColor : Color.primary.opacity(0.06))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(switchingTarget != nil)
                 }
-                .buttonStyle(.plain)
-                .help("点击切换协议模式：自动（同时适配标准与 LG）/ 仅标准 MCCS 0x60 / 仅 LG 0xF4")
             }
 
-            VStack(spacing: 6) {
-                ForEach(viewModel.ddcEndpoints) { ep in
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(viewModel.displayTitle(for: ep))
-                            .font(.system(size: 11.5, weight: .medium))
-                            .lineLimit(1)
+            // 校准与协议设置菜单（解决各型号 USB-C 硬件码不一致的问题）
+            Menu {
+                Text("硬件读出：\(status?.rawRead.rawSummary ?? "读取中…")")
 
-                        HStack(spacing: 4) {
-                            ForEach(DisplayInputSource.allCases) { source in
-                                Button(source.label) {
-                                    viewModel.switchInputSource(source, endpointIndex: ep.index)
-                                }
-                                .font(.system(size: 10.5, weight: .medium))
-                                .buttonStyle(.bordered)
-                                .controlSize(.mini)
+                Divider()
+
+                Menu("将当前亮屏端口校准为…") {
+                    ForEach(DisplayInputSource.allCases) { source in
+                        let existing = status?.calibratedCodes[source]
+                        let suffix = existing.map { " (\($0.hexSummary))" } ?? ""
+                        Button("\(source.label)\(suffix)") {
+                            viewModel.calibrateCurrentInput(
+                                as: source,
+                                endpointIndex: endpointIndex,
+                                displayName: displayName
+                            )
+                        }
+                    }
+                }
+
+                Menu("切换协议：\(viewModel.inputProtocolMode.label)") {
+                    ForEach(InputSourceProtocolMode.allCases) { mode in
+                        Button {
+                            viewModel.setInputProtocolMode(mode)
+                        } label: {
+                            if viewModel.inputProtocolMode == mode {
+                                Text("✓ \(mode.label)")
+                            } else {
+                                Text(mode.label)
                             }
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.primary.opacity(0.035))
-                    .cornerRadius(8)
                 }
+
+                Divider()
+
+                Button("重新读取当前输入源") {
+                    viewModel.refreshSingleInputStatusAsync(endpointIndex: endpointIndex)
+                }
+
+                if !(status?.calibratedCodes.isEmpty ?? true) {
+                    Button("重置此屏端口校准", role: .destructive) {
+                        viewModel.resetInputCalibration(endpointIndex: endpointIndex, displayName: displayName)
+                    }
+                }
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .frame(width: 22, height: 22)
+                    .background(Color.primary.opacity(0.06))
+                    .cornerRadius(5)
             }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 22)
+            .help("查看硬件输入码、校准 USB-C 等端口编码或切换协议模式")
         }
-        .padding(10)
-        .background(cardBackground)
     }
 
     // MARK: - Audio Card
@@ -619,7 +843,7 @@ struct MenuBarPopoverView: View {
                         .frame(width: 34, alignment: .trailing)
                 }
 
-                // 直接在主音量下方整合显示所有外接屏 DDC 音量（无需折叠展开，每台自带独立静音 + 滑块 + 一键联动）
+                // 整合显示所有外接屏 DDC 音量（使用自定义显示器名称）
                 if !viewModel.ddcEndpoints.isEmpty {
                     let endpointsToShow: [DDCDisplayEndpoint] = {
                         if viewModel.ddcEndpoints.count == 1,
@@ -653,7 +877,7 @@ struct MenuBarPopoverView: View {
                                 Text(epTitle)
                                     .font(.system(size: 11, weight: isLinkedToMain ? .semibold : .regular))
                                     .lineLimit(1)
-                                    .frame(width: 82, alignment: .leading)
+                                    .frame(width: 84, alignment: .leading)
 
                                 Slider(
                                     value: Binding(

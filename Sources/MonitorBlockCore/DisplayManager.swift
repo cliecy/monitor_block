@@ -29,14 +29,15 @@ public final class DisplayManager {
     }
 
     private func persist() {
-        let existingBindings = store.loadState().audioToDDCBindings
+        let existing = store.loadState()
         let state = PersistedAppState(
             cachedDisplays: cache.values.sorted { $0.id < $1.id },
             presets: presets,
             disableRules: disableRules,
             preDisableSnapshots: preDisableSnapshots,
             customNames: customNames,
-            audioToDDCBindings: existingBindings
+            audioToDDCBindings: existing.audioToDDCBindings,
+            calibratedInputCodes: existing.calibratedInputCodes
         )
         store.saveState(state)
     }
@@ -95,6 +96,7 @@ public final class DisplayManager {
                     DisplayInfo(
                         id: snap.id,
                         uuid: snap.uuid,
+                        serialNumber: snap.serialNumber,
                         name: resolvedName,
                         systemName: systemName,
                         customName: customName,

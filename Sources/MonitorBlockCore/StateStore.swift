@@ -51,6 +51,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
     public var preDisableSnapshots: [String: [DisplayPlacement]]
     public var customNames: [String: String]
     public var audioToDDCBindings: [String: Int]
+    public var calibratedInputCodes: [String: [String: DDCInputCode]]
 
     public init(
         cachedDisplays: [CachedDisplayRecord] = [],
@@ -58,7 +59,8 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         disableRules: [String: DisableLayoutRule] = [:],
         preDisableSnapshots: [String: [DisplayPlacement]] = [:],
         customNames: [String: String] = [:],
-        audioToDDCBindings: [String: Int] = [:]
+        audioToDDCBindings: [String: Int] = [:],
+        calibratedInputCodes: [String: [String: DDCInputCode]] = [:]
     ) {
         self.cachedDisplays = cachedDisplays
         self.presets = presets
@@ -66,6 +68,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.preDisableSnapshots = preDisableSnapshots
         self.customNames = customNames
         self.audioToDDCBindings = audioToDDCBindings
+        self.calibratedInputCodes = calibratedInputCodes
     }
 
     enum CodingKeys: String, CodingKey {
@@ -75,6 +78,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         case preDisableSnapshots
         case customNames
         case audioToDDCBindings
+        case calibratedInputCodes
     }
 
     public init(from decoder: Decoder) throws {
@@ -85,6 +89,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.preDisableSnapshots = try container.decodeIfPresent([String: [DisplayPlacement]].self, forKey: .preDisableSnapshots) ?? [:]
         self.customNames = try container.decodeIfPresent([String: String].self, forKey: .customNames) ?? [:]
         self.audioToDDCBindings = try container.decodeIfPresent([String: Int].self, forKey: .audioToDDCBindings) ?? [:]
+        self.calibratedInputCodes = try container.decodeIfPresent([String: [String: DDCInputCode]].self, forKey: .calibratedInputCodes) ?? [:]
     }
 }
 

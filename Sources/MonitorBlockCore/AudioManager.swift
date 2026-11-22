@@ -400,15 +400,18 @@ public final class CoreAudioBackend: AudioBackend {
     }
 }
 
-/// 统一管理音频输出切换、CoreAudio 音量与外接显示器 DDC/CI 硬件音量
-public final class AudioManager {
+/// 统一管理音频输出切换、CoreAudio 音量与外接显示器 DDC/CI 硬件音量及输入源
+public final class AudioManager: @unchecked Sendable {
     private let audioBackend: AudioBackend
     private let ddcBackend: DDCBackend
     private let store: StateStoreProtocol
+    private let lock = NSLock()
     private var cachedDDCVolumes: [Int: Int] = [:]
     private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
     private var preferredDDCEndpointByAudioUID: [String: Int]
+    private var calibratedInputCodes: [String: [String: DDCInputCode]]
+    private var cachedInputStatuses: [Int: DisplayInputStatus] = [:]
 
     public init(
         audioBackend: AudioBackend = CoreAudioBackend(),
@@ -418,7 +421,9 @@ public final class AudioManager {
         self.audioBackend = audioBackend
         self.ddcBackend = ddcBackend
         self.store = store
-        self.preferredDDCEndpointByAudioUID = store.loadState().audioToDDCBindings
+        let loaded = store.loadState()
+        self.preferredDDCEndpointByAudioUID = loaded.audioToDDCBindings
+        self.calibratedInputCodes = loaded.calibratedInputCodes
     }
 
     public func listOutputDevices() -> [AudioOutputDevice] {
@@ -578,7 +583,156 @@ public final class AudioManager {
         endpointIndex: Int,
         protocolMode: InputSourceProtocolMode = .auto
     ) -> Bool {
-        ddcBackend.setInputSource(source, endpointIndex: endpointIndex, protocolMode: protocolMode)
+        if let code = calibratedCode(for: source, endpointIndex: endpointIndex) {
+            return ddcBackend.writeRawInputCode(code, endpointIndex: endpointIndex)
+        }
+        return ddcBackend.setInputSource(source, endpointIndex: endpointIndex, protocolMode: protocolMode)
+    }
+
+    public func readDisplayInputStatus(endpointIndex: Int) -> DisplayInputStatus {
+        let raw = ddcBackend.readInputSource(endpointIndex: endpointIndex)
+        let calibrated = calibratedCodesMap(forEndpointIndex: endpointIndex)
+        let active = DisplayInputSource.resolve(from: raw, calibrated: calibrated)
+        let status = DisplayInputStatus(activeSource: active, rawRead: raw, calibratedCodes: calibrated)
+        lock.lock()
+        cachedInputStatuses[endpointIndex] = status
+        lock.unlock()
+        return status
+    }
+
+    public func cachedDisplayInputStatus(endpointIndex: Int) -> DisplayInputStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cachedInputStatuses[endpointIndex]
+    }
+
+    /// 读取当前亮屏端口的真实硬件 VCP 码，并永久校准绑定到指定输入源（解决不同型号 USB-C 编码差异）
+    @discardableResult
+    public func calibrateCurrentInputSource(
+        as source: DisplayInputSource,
+        endpointIndex: Int
+    ) -> DDCInputCode? {
+        let endpoints = ddcBackend.listEndpoints()
+        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else {
+            return nil
+        }
+        let read = ddcBackend.readInputSource(endpointIndex: endpointIndex)
+        guard let code = read.preferredCode else {
+            return nil
+        }
+
+        lock.lock()
+        var map = calibratedInputCodes[endpoint.storageKey] ?? [:]
+        map[source.rawValue] = code
+        calibratedInputCodes[endpoint.storageKey] = map
+        let snapshotToSave = calibratedInputCodes
+        lock.unlock()
+
+        var state = store.loadState()
+        state.calibratedInputCodes = snapshotToSave
+        store.saveState(state)
+
+        // 更新缓存状态使高亮立刻生效
+        let updated = DisplayInputStatus(
+            activeSource: source,
+            rawRead: read,
+            calibratedCodes: calibratedCodesMap(forStorageKey: endpoint.storageKey)
+        )
+        lock.lock()
+        cachedInputStatuses[endpointIndex] = updated
+        lock.unlock()
+        return code
+    }
+
+    public func resetInputCalibration(endpointIndex: Int) {
+        let endpoints = ddcBackend.listEndpoints()
+        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return }
+
+        lock.lock()
+        calibratedInputCodes.removeValue(forKey: endpoint.storageKey)
+        let snapshotToSave = calibratedInputCodes
+        cachedInputStatuses.removeValue(forKey: endpointIndex)
+        lock.unlock()
+
+        var state = store.loadState()
+        state.calibratedInputCodes = snapshotToSave
+        store.saveState(state)
+    }
+
+    /// 将外接显示器 DisplayInfo（含用户自定义名称）精准映射到对应的 DDC 端点
+    public func matchDDCEndpoint(
+        for display: DisplayInfo,
+        allDisplays: [DisplayInfo],
+        endpoints: [DDCDisplayEndpoint]? = nil
+    ) -> DDCDisplayEndpoint? {
+        guard !display.isBuiltin, ddcBackend.isAvailable else { return nil }
+        let eps = endpoints ?? ddcBackend.listEndpoints()
+        guard !eps.isEmpty else { return nil }
+
+        // 1. 优先通过硬件序列号精准匹配（两台同型号 LG 序列号唯一）
+        if let serial = display.serialNumber?.lowercased(), serial.count >= 4,
+           let bySerial = eps.first(where: {
+               guard let epSerial = $0.serialNumber?.lowercased(), !epSerial.isEmpty else { return false }
+               return epSerial == serial || epSerial.contains(serial) || serial.contains(epSerial)
+           }) {
+            return bySerial
+        }
+
+        // 2. 按系统型号名匹配（同名多屏按外接屏顺序一一对应）
+        func normalize(_ text: String) -> String {
+            text.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        let normSysName = normalize(display.systemName)
+        let matchedEPs = eps.filter {
+            let normEP = normalize($0.name)
+            return !normSysName.isEmpty && !normEP.isEmpty && (normSysName.contains(normEP) || normEP.contains(normSysName))
+        }
+        let activeExternals = allDisplays.filter { !$0.isBuiltin && $0.isActive }
+        if matchedEPs.count == 1 {
+            return matchedEPs[0]
+        }
+        if matchedEPs.count > 1 {
+            let sameNameDisplays = activeExternals.filter { normalize($0.systemName) == normSysName }
+            if let pos = sameNameDisplays.firstIndex(where: { $0.id == display.id }),
+               matchedEPs.indices.contains(pos) {
+                return matchedEPs[pos]
+            }
+            return matchedEPs[0]
+        }
+
+        // 3. 兜底按活跃外接屏顺序对应
+        if let pos = activeExternals.firstIndex(where: { $0.id == display.id }),
+           eps.indices.contains(pos) {
+            return eps[pos]
+        }
+        return nil
+    }
+
+    private func calibratedCode(for source: DisplayInputSource, endpointIndex: Int) -> DDCInputCode? {
+        let endpoints = ddcBackend.listEndpoints()
+        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return calibratedInputCodes[endpoint.storageKey]?[source.rawValue]
+    }
+
+    private func calibratedCodesMap(forEndpointIndex endpointIndex: Int) -> [DisplayInputSource: DDCInputCode] {
+        let endpoints = ddcBackend.listEndpoints()
+        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return [:] }
+        return calibratedCodesMap(forStorageKey: endpoint.storageKey)
+    }
+
+    private func calibratedCodesMap(forStorageKey key: String) -> [DisplayInputSource: DDCInputCode] {
+        lock.lock()
+        let rawMap = calibratedInputCodes[key] ?? [:]
+        lock.unlock()
+        var result: [DisplayInputSource: DDCInputCode] = [:]
+        for (rawKey, code) in rawMap {
+            if let source = DisplayInputSource(rawValue: rawKey) {
+                result[source] = code
+            }
+        }
+        return result
     }
 
     public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {

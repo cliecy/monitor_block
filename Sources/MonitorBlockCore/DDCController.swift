@@ -8,6 +8,8 @@ public protocol DDCBackend: AnyObject {
     func readVolume(endpointIndex: Int) -> Int?
     func setVolume(_ volume: Int, endpointIndex: Int) -> Bool
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool
+    func readInputSource(endpointIndex: Int) -> DDCInputReadResult
+    func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool
     func setInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
@@ -154,6 +156,46 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         )
     }
 
+    public func readInputSource(endpointIndex: Int) -> DDCInputReadResult {
+        let services = discoverExternalAVServices()
+        guard services.indices.contains(endpointIndex) else {
+            return DDCInputReadResult()
+        }
+        let target = services[endpointIndex]
+        let isLG = target.name.lowercased().contains("lg")
+
+        let stdRaw = readVCPRaw(
+            code: Self.vcpInputSelectStandard,
+            service: target.service,
+            dataAddress: Self.dataAddressStandard
+        )
+        let stdVal = stdRaw.map { $0 & 0xFF }
+
+        var lgVal: UInt16? = nil
+        if isLG {
+            usleep(20_000)
+            let lgRaw = readVCPRaw(
+                code: Self.vcpInputSelectLGAlt,
+                service: target.service,
+                dataAddress: Self.dataAddressLGAlt
+            )
+            lgVal = lgRaw.map { $0 & 0xFF }
+        }
+
+        return DDCInputReadResult(standardValue: stdVal, lgAltValue: lgVal)
+    }
+
+    public func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool {
+        let services = discoverExternalAVServices()
+        guard services.indices.contains(endpointIndex) else { return false }
+        return writeVCP(
+            code: code.vcpCode,
+            value: code.value,
+            service: services[endpointIndex].service,
+            dataAddress: code.dataAddress
+        )
+    }
+
     public func setInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
@@ -165,56 +207,104 @@ public final class AppleSiliconDDCBackend: DDCBackend {
 
         switch protocolMode {
         case .standard:
-            return writeVCP(
-                code: Self.vcpInputSelectStandard,
-                value: source.standardCode,
-                service: target.service,
-                dataAddress: Self.dataAddressStandard
+            return sendCandidates(
+                source.standardCandidateCodes,
+                vcpCode: Self.vcpInputSelectStandard,
+                dataAddress: Self.dataAddressStandard,
+                service: target.service
             )
 
         case .lgAlt:
-            return writeVCP(
-                code: Self.vcpInputSelectLGAlt,
-                value: source.lgAltCode,
-                service: target.service,
-                dataAddress: Self.dataAddressLGAlt
+            return sendCandidates(
+                source.lgAltCandidateCodes,
+                vcpCode: Self.vcpInputSelectLGAlt,
+                dataAddress: Self.dataAddressLGAlt,
+                service: target.service
             )
 
         case .auto:
             let isLG = target.name.lowercased().contains("lg")
             if isLG {
-                // 新款 LG 优先走专有 I2C 0x50 + VCP 0xF4，并补发标准 0x51 + VCP 0x60 兼容老款 LG
-                let altOK = writeVCP(
-                    code: Self.vcpInputSelectLGAlt,
-                    value: source.lgAltCode,
-                    service: target.service,
-                    dataAddress: Self.dataAddressLGAlt
+                // 对 LG 先发专有 0x50/0xF4 候选码（USB-C 会依次发 0xD1、0xD2），间隔足够时间后再补标准 0x51/0x60
+                let altOK = sendCandidates(
+                    source.lgAltCandidateCodes,
+                    vcpCode: Self.vcpInputSelectLGAlt,
+                    dataAddress: Self.dataAddressLGAlt,
+                    service: target.service
                 )
-                usleep(25_000)
-                let stdOK = writeVCP(
-                    code: Self.vcpInputSelectStandard,
-                    value: source.standardCode,
-                    service: target.service,
-                    dataAddress: Self.dataAddressStandard
+                usleep(60_000)
+                let stdOK = sendCandidates(
+                    source.standardCandidateCodes,
+                    vcpCode: Self.vcpInputSelectStandard,
+                    dataAddress: Self.dataAddressStandard,
+                    service: target.service
                 )
                 return altOK || stdOK
             } else {
                 // 其他品牌优先标准 MCCS 0x60，失败时自动回退尝试 0x50/0xF4
-                let stdOK = writeVCP(
-                    code: Self.vcpInputSelectStandard,
-                    value: source.standardCode,
-                    service: target.service,
-                    dataAddress: Self.dataAddressStandard
+                let stdOK = sendCandidates(
+                    source.standardCandidateCodes,
+                    vcpCode: Self.vcpInputSelectStandard,
+                    dataAddress: Self.dataAddressStandard,
+                    service: target.service
                 )
                 if stdOK { return true }
-                return writeVCP(
-                    code: Self.vcpInputSelectLGAlt,
-                    value: source.lgAltCode,
-                    service: target.service,
-                    dataAddress: Self.dataAddressLGAlt
+                return sendCandidates(
+                    source.lgAltCandidateCodes,
+                    vcpCode: Self.vcpInputSelectLGAlt,
+                    dataAddress: Self.dataAddressLGAlt,
+                    service: target.service
                 )
             }
         }
+    }
+
+    private func sendCandidates(
+        _ values: [UInt16],
+        vcpCode: UInt8,
+        dataAddress: UInt32,
+        service: CFTypeRef
+    ) -> Bool {
+        var anyOK = false
+        for (idx, val) in values.enumerated() {
+            if idx > 0 {
+                usleep(60_000)
+            }
+            if writeVCP(code: vcpCode, value: val, service: service, dataAddress: dataAddress) {
+                anyOK = true
+            }
+        }
+        return anyOK
+    }
+
+    private func readVCPRaw(
+        code: UInt8,
+        service: CFTypeRef,
+        dataAddress: UInt32
+    ) -> UInt16? {
+        guard let writeI2C, let readI2C else { return nil }
+
+        let addrByte = UInt8(dataAddress & 0xFF)
+        let checksum: UInt8 = 0x6E ^ addrByte ^ 0x82 ^ 0x01 ^ code
+        var request: [UInt8] = [0x82, 0x01, code, checksum]
+
+        let writeStatus = request.withUnsafeMutableBytes { buf -> IOReturn in
+            guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
+            return writeI2C(service, Self.chipAddress, dataAddress, ptr, UInt32(buf.count))
+        }
+        guard writeStatus == kIOReturnSuccess else { return nil }
+
+        usleep(40_000)
+
+        var reply = [UInt8](repeating: 0, count: 12)
+        let readStatus = reply.withUnsafeMutableBytes { buf -> IOReturn in
+            guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
+            return readI2C(service, Self.chipAddress, dataAddress, ptr, UInt32(buf.count))
+        }
+        guard readStatus == kIOReturnSuccess else { return nil }
+        guard reply[2] == 0x02, reply[3] == 0x00, reply[4] == code else { return nil }
+
+        return (UInt16(reply[8]) << 8) | UInt16(reply[9])
     }
 
     private func writeVCP(

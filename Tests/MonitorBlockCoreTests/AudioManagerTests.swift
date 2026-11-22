@@ -58,9 +58,11 @@ private final class MockDDCBackend: DDCBackend {
     var isAvailable: Bool = true
     var endpoints: [DDCDisplayEndpoint] = []
     var hardwareVolumes: [Int: Int] = [:]
+    var hardwareInputs: [Int: DDCInputReadResult] = [:]
     var setVolumeCalls: [(index: Int, volume: Int)] = []
     var setMuteCalls: [(index: Int, muted: Bool)] = []
     var setInputCalls: [(index: Int, source: DisplayInputSource, mode: InputSourceProtocolMode)] = []
+    var writeRawInputCalls: [(index: Int, code: DDCInputCode)] = []
     var muteSupported: Bool = true
 
     func listEndpoints() -> [DDCDisplayEndpoint] {
@@ -80,6 +82,15 @@ private final class MockDDCBackend: DDCBackend {
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
         setMuteCalls.append((endpointIndex, muted))
         return muteSupported
+    }
+
+    func readInputSource(endpointIndex: Int) -> DDCInputReadResult {
+        hardwareInputs[endpointIndex] ?? DDCInputReadResult()
+    }
+
+    func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool {
+        writeRawInputCalls.append((endpointIndex, code))
+        return true
     }
 
     func setInputSource(
@@ -257,13 +268,52 @@ struct AudioManagerTests {
         #expect(ddc.setInputCalls[1].source == .usbC)
         #expect(ddc.setInputCalls[1].mode == .standard)
 
-        // 校验 LG 专有 VCP 0xF4 编码与标准 MCCS 0x60 编码
+        // 校验 LG 专有 VCP 0xF4 编码（USB-C 同时覆盖 0xD1 与 0xD2）与标准 MCCS 0x60 编码
         #expect(DisplayInputSource.hdmi1.lgAltCode == 0x90)
         #expect(DisplayInputSource.hdmi2.lgAltCode == 0x91)
         #expect(DisplayInputSource.displayPort1.lgAltCode == 0xD0)
         #expect(DisplayInputSource.displayPort2.lgAltCode == 0xD1)
-        #expect(DisplayInputSource.usbC.lgAltCode == 0xD2)
+        #expect(DisplayInputSource.usbC.lgAltCandidateCodes == [0xD1, 0xD2])
         #expect(DisplayInputSource.hdmi1.standardCode == 0x11)
         #expect(DisplayInputSource.displayPort1.standardCode == 0x0F)
+    }
+
+    @Test("回读当前硬件输入源、校准 USB-C 自定义硬件码并精准下发")
+    func readAndCalibrateUSBCCode() throws {
+        let store = InMemoryStateStore()
+        let ddc = MockDDCBackend()
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "LG HDR 4K", serialNumber: "SN-LG-LEFT"),
+            DDCDisplayEndpoint(index: 1, name: "LG HDR 4K", serialNumber: "SN-LG-RIGHT")
+        ]
+        // 模拟一台把 USB-C 映射在非常规码 0x60=0x10 的显示器
+        ddc.hardwareInputs = [
+            0: DDCInputReadResult(standardValue: 0x10, lgAltValue: nil),
+            1: DDCInputReadResult(standardValue: nil, lgAltValue: 0xD1)
+        ]
+
+        let manager = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: store)
+
+        // 右屏 0xF4=0xD1 应自动识别为 USB-C
+        let rightStatus = manager.readDisplayInputStatus(endpointIndex: 1)
+        #expect(rightStatus.activeSource == .usbC)
+
+        // 左屏校准当前端口（0x60=0x10）为 USB-C
+        let calibrated = try #require(manager.calibrateCurrentInputSource(as: .usbC, endpointIndex: 0))
+        #expect(calibrated == DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x10))
+
+        // 重启后再次切换左屏到 USB-C，应精准直发已校准的 raw code (0x60=0x10)
+        let restarted = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: store)
+        #expect(restarted.setDisplayInputSource(.usbC, endpointIndex: 0, protocolMode: .auto) == true)
+        #expect(ddc.writeRawInputCalls.last?.index == 0)
+        #expect(ddc.writeRawInputCalls.last?.code == calibrated)
+
+        // 序列号精准匹配 DisplayInfo -> DDCDisplayEndpoint
+        let displays = [
+            DisplayInfo(id: 2, uuid: "u-left", serialNumber: "SN-LG-LEFT", name: "左 LG", systemName: "LG HDR 4K", isBuiltin: false, isActive: true, isOnline: true, width: 3840, height: 2160),
+            DisplayInfo(id: 3, uuid: "u-right", serialNumber: "SN-LG-RIGHT", name: "右 LG", systemName: "LG HDR 4K", isBuiltin: false, isActive: true, isOnline: true, width: 3840, height: 2160)
+        ]
+        #expect(restarted.matchDDCEndpoint(for: displays[0], allDisplays: displays)?.index == 0)
+        #expect(restarted.matchDDCEndpoint(for: displays[1], allDisplays: displays)?.index == 1)
     }
 }
