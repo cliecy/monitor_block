@@ -7,6 +7,7 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
     public let id: CGDirectDisplayID
     public let uuid: String
     public let serialNumber: String?
+    public let numericSerial: UInt32?
     public let name: String?
     public let isBuiltin: Bool
     public let isActive: Bool
@@ -22,6 +23,7 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
         id: CGDirectDisplayID,
         uuid: String,
         serialNumber: String? = nil,
+        numericSerial: UInt32? = nil,
         name: String?,
         isBuiltin: Bool,
         isActive: Bool,
@@ -36,6 +38,7 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
         self.id = id
         self.uuid = uuid
         self.serialNumber = serialNumber
+        self.numericSerial = numericSerial
         self.name = name
         self.isBuiltin = isBuiltin
         self.isActive = isActive
@@ -202,7 +205,8 @@ public final class CoreGraphicsBackend: DisplayBackend {
             let meta = coreDisplayMetadata(for: id)
             let name = screenNames[id] ?? meta.name
             let cgSerial = CGDisplaySerialNumber(id)
-            let serialNumber = meta.serial ?? (cgSerial != 0 ? String(cgSerial) : nil)
+            let numericSerial: UInt32? = meta.numericSerial ?? (cgSerial != 0 ? cgSerial : nil)
+            let serialNumber = meta.alphaSerial ?? numericSerial.map { String($0) }
 
             // CGDisplayBounds 返回逻辑点坐标与尺寸，与 CGConfigureDisplayOrigin 单位一致
             let bounds = CGDisplayBounds(id)
@@ -230,6 +234,7 @@ public final class CoreGraphicsBackend: DisplayBackend {
                 id: id,
                 uuid: uuid,
                 serialNumber: serialNumber,
+                numericSerial: numericSerial,
                 name: name,
                 isBuiltin: isBuiltin,
                 isActive: isActive,
@@ -364,10 +369,10 @@ public final class CoreGraphicsBackend: DisplayBackend {
         return result
     }
 
-    private func coreDisplayMetadata(for displayID: CGDirectDisplayID) -> (name: String?, serial: String?) {
+    private func coreDisplayMetadata(for displayID: CGDirectDisplayID) -> (name: String?, alphaSerial: String?, numericSerial: UInt32?) {
         guard let createDisplayInfoDictionary,
               let info = createDisplayInfoDictionary(displayID)?.takeRetainedValue() as? [String: Any] else {
-            return (nil, nil)
+            return (nil, nil, nil)
         }
 
         var resolvedName: String?
@@ -381,9 +386,10 @@ public final class CoreGraphicsBackend: DisplayBackend {
             }
         }
 
-        let serialStr = (info["DisplaySerialString"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            ?? (info["DisplaySerialNumber"] as? NSNumber).flatMap { $0.uint32Value != 0 ? $0.stringValue : nil }
+        let alphaSerial = (info["DisplaySerialString"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (info["AlphanumericSerialNumber"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let numSerial = (info["DisplaySerialNumber"] as? NSNumber).flatMap { $0.uint32Value != 0 ? $0.uint32Value : nil }
 
-        return (resolvedName, serialStr)
+        return (resolvedName, alphaSerial, numSerial)
     }
 }

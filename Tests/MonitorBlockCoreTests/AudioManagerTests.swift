@@ -316,4 +316,65 @@ struct AudioManagerTests {
         #expect(restarted.matchDDCEndpoint(for: displays[0], allDisplays: displays)?.index == 0)
         #expect(restarted.matchDDCEndpoint(for: displays[1], allDisplays: displays)?.index == 1)
     }
+
+    @Test("双同型号 LG 通过数字 EDID 序列号精确匹配，自定义改名与镜像态绝不导致 DDC 通道错位")
+    func dualIdenticalLGMatchesByNumericSerialRegardlessOfCustomNameOrder() {
+        let store = InMemoryStateStore()
+        let ddc = MockDDCBackend()
+        // IOKit 端点：index 0 是数字序列号 222222（字母串 SN-RIGHT），index 1 是 111111（字母串 SN-CENTER）
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "LG HDR 4K", serialNumber: "SN-RIGHT", numericSerial: 222222),
+            DDCDisplayEndpoint(index: 1, name: "LG HDR 4K", serialNumber: "SN-CENTER", numericSerial: 111111)
+        ]
+
+        // CoreGraphics 往往只拿到数字序列号，且用户起自定义中文名后顺序与 IOKit 相反，甚至其中一台在镜像中
+        let centerDisplay = DisplayInfo(
+            id: 10,
+            uuid: "u-center",
+            serialNumber: "111111",
+            numericSerial: 111111,
+            name: "中间屏",
+            systemName: "LG HDR 4K",
+            customName: "中间屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: 0,
+            width: 3840,
+            height: 2160,
+            isMain: true
+        )
+        let rightDisplay = DisplayInfo(
+            id: 20,
+            uuid: "u-right",
+            serialNumber: "222222",
+            numericSerial: 222222,
+            name: "右屏",
+            systemName: "LG HDR 4K",
+            customName: "右屏",
+            isBuiltin: false,
+            isActive: false,
+            isOnline: true,
+            originX: 3840,
+            width: 3840,
+            height: 2160,
+            isMain: false,
+            mirrorMasterID: 10,
+            usageMode: .mirrored(masterID: 10, masterUUID: "u-center", masterName: "中间屏")
+        )
+
+        let manager = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: store)
+        let mapping = manager.matchAllDDCEndpoints(for: [centerDisplay, rightDisplay], endpoints: ddc.endpoints)
+
+        // 中间屏 (111111) 必须精准对应 index 1，右屏 (222222，即使在镜像态) 必须精准对应 index 0
+        #expect(mapping["u-center"] == 1)
+        #expect(mapping["u-right"] == 0)
+
+        // 手动纠偏互换后，重启仍持久记住互换后的绑定关系
+        manager.bindDisplay("u-center", toEndpoint: ddc.endpoints[0])
+        let restarted = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: store)
+        let reboundMapping = restarted.matchAllDDCEndpoints(for: [centerDisplay, rightDisplay], endpoints: ddc.endpoints)
+        #expect(reboundMapping["u-center"] == 0)
+        #expect(reboundMapping["u-right"] == 1)
+    }
 }

@@ -37,6 +37,7 @@ public final class DisplayManager {
             preDisableSnapshots: preDisableSnapshots,
             customNames: customNames,
             audioToDDCBindings: existing.audioToDDCBindings,
+            displayToDDCBindings: existing.displayToDDCBindings,
             calibratedInputCodes: existing.calibratedInputCodes
         )
         store.saveState(state)
@@ -121,6 +122,7 @@ public final class DisplayManager {
                         id: snap.id,
                         uuid: snap.uuid,
                         serialNumber: snap.serialNumber,
+                        numericSerial: snap.numericSerial,
                         name: meta.name,
                         systemName: meta.systemName,
                         customName: meta.customName,
@@ -172,12 +174,16 @@ public final class DisplayManager {
             persist()
         }
 
+        // 按稳定的物理顺序排列：内置屏在前，外接屏启用在前且按水平位置 originX 从左到右，再按 displayID 兜底（改名绝不乱跳）
         return results.sorted { lhs, rhs in
             if lhs.isBuiltin != rhs.isBuiltin {
                 return lhs.isBuiltin
             }
-            if lhs.name != rhs.name {
-                return lhs.name < rhs.name
+            if lhs.isEnabledForDisplay != rhs.isEnabledForDisplay {
+                return lhs.isEnabledForDisplay
+            }
+            if lhs.originX != rhs.originX {
+                return lhs.originX < rhs.originX
             }
             return lhs.id < rhs.id
         }

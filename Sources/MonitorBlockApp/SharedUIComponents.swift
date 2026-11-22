@@ -215,6 +215,7 @@ struct DisplayModeSegmentedControl: View {
 // MARK: - Input Source Control Strip (with Hardware Readback & Calibration)
 
 struct InputSourceControlStrip: View {
+    let displayUUID: String
     let endpointIndex: Int
     let displayName: String
     @ObservedObject var viewModel: AppViewModel
@@ -290,6 +291,24 @@ struct InputSourceControlStrip: View {
                                 Text("✓ \(mode.label)")
                             } else {
                                 Text(mode.label)
+                            }
+                        }
+                    }
+                }
+
+                if viewModel.ddcEndpoints.count > 1 {
+                    Menu("DDC 硬件通道（通道 #\(endpointIndex + 1)）") {
+                        ForEach(viewModel.ddcEndpoints) { ep in
+                            let serialHint = ep.serialNumber.map { " · SN:\($0.suffix(4))" } ?? ""
+                            let label = "通道 #\(ep.index + 1) \(ep.name)\(serialHint)"
+                            Button {
+                                viewModel.bindDisplay(displayUUID, toDDCEndpoint: ep)
+                            } label: {
+                                if ep.index == endpointIndex {
+                                    Text("✓ \(label)")
+                                } else {
+                                    Text(label)
+                                }
                             }
                         }
                     }
@@ -416,6 +435,7 @@ struct DisplayControlCard: View {
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundColor(.secondary)
                             InputSourceControlStrip(
+                                displayUUID: display.uuid,
                                 endpointIndex: idx,
                                 displayName: display.name,
                                 viewModel: viewModel

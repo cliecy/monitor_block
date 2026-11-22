@@ -410,6 +410,7 @@ public final class AudioManager: @unchecked Sendable {
     private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
     private var preferredDDCEndpointByAudioUID: [String: Int]
+    private var preferredDDCKeyByDisplayUUID: [String: String]
     private var calibratedInputCodes: [String: [String: DDCInputCode]]
     private var cachedInputStatuses: [Int: DisplayInputStatus] = [:]
 
@@ -423,6 +424,7 @@ public final class AudioManager: @unchecked Sendable {
         self.store = store
         let loaded = store.loadState()
         self.preferredDDCEndpointByAudioUID = loaded.audioToDDCBindings
+        self.preferredDDCKeyByDisplayUUID = loaded.displayToDDCBindings
         self.calibratedInputCodes = loaded.calibratedInputCodes
     }
 
@@ -438,6 +440,7 @@ public final class AudioManager: @unchecked Sendable {
                 index: endpoint.index,
                 name: endpoint.name,
                 serialNumber: endpoint.serialNumber,
+                numericSerial: endpoint.numericSerial,
                 registryPath: endpoint.registryPath,
                 currentVolume: cachedVol,
                 isMuted: cachedMute
@@ -659,53 +662,132 @@ public final class AudioManager: @unchecked Sendable {
         store.saveState(state)
     }
 
-    /// 将外接显示器 DisplayInfo（含用户自定义名称）精准映射到对应的 DDC 端点
+    /// 手动纠偏并持久化某台显示器对应的 DDC 硬件通道（若另一台屏占用了该通道会自动互换）
+    public func bindDisplay(
+        _ displayUUID: String,
+        toEndpoint endpoint: DDCDisplayEndpoint
+    ) {
+        lock.lock()
+        let oldKeyForDisplay = preferredDDCKeyByDisplayUUID[displayUUID]
+        // 如果其他显示器曾绑定到此通道，顺手互换，避免冲突
+        if let conflictUUID = preferredDDCKeyByDisplayUUID.first(where: { $0.key != displayUUID && $0.value == endpoint.storageKey })?.key {
+            if let oldKeyForDisplay {
+                preferredDDCKeyByDisplayUUID[conflictUUID] = oldKeyForDisplay
+            } else {
+                preferredDDCKeyByDisplayUUID.removeValue(forKey: conflictUUID)
+            }
+        }
+        preferredDDCKeyByDisplayUUID[displayUUID] = endpoint.storageKey
+        let snapshotToSave = preferredDDCKeyByDisplayUUID
+        lock.unlock()
+
+        var state = store.loadState()
+        state.displayToDDCBindings = snapshotToSave
+        store.saveState(state)
+    }
+
+    /// 全局一对一独占匹配：将所有已启用的外接显示器精准映射到各自的 DDC 端点，绝不受自定义改名排序影响
+    public func matchAllDDCEndpoints(
+        for displays: [DisplayInfo],
+        endpoints: [DDCDisplayEndpoint]? = nil
+    ) -> [String: Int] {
+        guard ddcBackend.isAvailable else { return [:] }
+        let eps = endpoints ?? ddcBackend.listEndpoints()
+        guard !eps.isEmpty else { return [:] }
+
+        // 严格按 CGDirectDisplayID 稳定升序处理，绝不受用户自定义名称排序影响！
+        let enabledExternals = displays
+            .filter { !$0.isBuiltin && $0.isEnabledForDisplay }
+            .sorted { $0.id < $1.id }
+
+        var result: [String: Int] = [:]
+        var usedEndpoints = Set<Int>()
+
+        lock.lock()
+        let savedBindings = preferredDDCKeyByDisplayUUID
+        lock.unlock()
+
+        // 第 1 轮：持久化手动绑定
+        for display in enabledExternals {
+            if let targetKey = savedBindings[display.uuid],
+               let ep = eps.first(where: { !usedEndpoints.contains($0.index) && $0.storageKey == targetKey }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        // 第 2 轮：32-bit 数字 EDID 序列号精确匹配（Apple Silicon CoreGraphics 与 IOKit 两端通用！）
+        for display in enabledExternals where result[display.uuid] == nil {
+            if let num = display.numericSerial, num != 0,
+               let ep = eps.first(where: { !usedEndpoints.contains($0.index) && $0.numericSerial == num }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        // 第 3 轮：字母数字序列号精确匹配
+        for display in enabledExternals where result[display.uuid] == nil {
+            if let serial = display.serialNumber?.lowercased(), serial.count >= 4,
+               let ep = eps.first(where: {
+                   guard !usedEndpoints.contains($0.index),
+                         let epSerial = $0.serialNumber?.lowercased(), !epSerial.isEmpty else {
+                       return false
+                   }
+                   return epSerial == serial || epSerial.contains(serial) || serial.contains(epSerial)
+               }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        // 第 4 轮：系统型号名模糊匹配（按稳定 displayID 顺序一对一独占分配）
+        func normalize(_ text: String) -> String {
+            text.lowercased().filter { $0.isLetter || $0.isNumber }
+        }
+        for display in enabledExternals where result[display.uuid] == nil {
+            let normSys = normalize(display.systemName)
+            guard !normSys.isEmpty else { continue }
+            if let ep = eps.first(where: {
+                guard !usedEndpoints.contains($0.index) else { return false }
+                let normEP = normalize($0.name)
+                return !normEP.isEmpty && (normSys.contains(normEP) || normEP.contains(normSys))
+            }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        // 第 5 轮：按稳定 displayID 顺序兜底独占分配剩余端点
+        for display in enabledExternals where result[display.uuid] == nil {
+            if let ep = eps.first(where: { !usedEndpoints.contains($0.index) }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        return result
+    }
+
+    /// 便捷方法：返回单台显示器对应的 DDC 端点（复用全局一对一算法）
     public func matchDDCEndpoint(
         for display: DisplayInfo,
         allDisplays: [DisplayInfo],
         endpoints: [DDCDisplayEndpoint]? = nil
     ) -> DDCDisplayEndpoint? {
-        guard !display.isBuiltin, ddcBackend.isAvailable else { return nil }
         let eps = endpoints ?? ddcBackend.listEndpoints()
-        guard !eps.isEmpty else { return nil }
+        let mapping = matchAllDDCEndpoints(for: allDisplays, endpoints: eps)
+        guard let idx = mapping[display.uuid] else { return nil }
+        return eps.first(where: { $0.index == idx })
+    }
 
-        // 1. 优先通过硬件序列号精准匹配（两台同型号 LG 序列号唯一）
-        if let serial = display.serialNumber?.lowercased(), serial.count >= 4,
-           let bySerial = eps.first(where: {
-               guard let epSerial = $0.serialNumber?.lowercased(), !epSerial.isEmpty else { return false }
-               return epSerial == serial || epSerial.contains(serial) || serial.contains(epSerial)
-           }) {
-            return bySerial
-        }
-
-        // 2. 按系统型号名匹配（同名多屏按外接屏顺序一一对应）
-        func normalize(_ text: String) -> String {
-            text.lowercased().filter { $0.isLetter || $0.isNumber }
-        }
-        let normSysName = normalize(display.systemName)
-        let matchedEPs = eps.filter {
-            let normEP = normalize($0.name)
-            return !normSysName.isEmpty && !normEP.isEmpty && (normSysName.contains(normEP) || normEP.contains(normSysName))
-        }
-        let activeExternals = allDisplays.filter { !$0.isBuiltin && $0.isActive }
-        if matchedEPs.count == 1 {
-            return matchedEPs[0]
-        }
-        if matchedEPs.count > 1 {
-            let sameNameDisplays = activeExternals.filter { normalize($0.systemName) == normSysName }
-            if let pos = sameNameDisplays.firstIndex(where: { $0.id == display.id }),
-               matchedEPs.indices.contains(pos) {
-                return matchedEPs[pos]
-            }
-            return matchedEPs[0]
-        }
-
-        // 3. 兜底按活跃外接屏顺序对应
-        if let pos = activeExternals.firstIndex(where: { $0.id == display.id }),
-           eps.indices.contains(pos) {
-            return eps[pos]
-        }
-        return nil
+    /// 便捷方法：返回某音频输出设备对应的 DDC 端点索引（用于 UI 统一显示自定义显示器名称）
+    public func matchedDDCEndpointIndex(
+        for device: AudioOutputDevice,
+        allDevices: [AudioOutputDevice]? = nil
+    ) -> Int? {
+        guard !device.supportsCoreAudioVolume else { return nil }
+        let devices = allDevices ?? audioBackend.listOutputDevices()
+        return matchDDCEndpoint(for: device, allDevices: devices)?.index
     }
 
     private func calibratedCode(for source: DisplayInputSource, endpointIndex: Int) -> DDCInputCode? {

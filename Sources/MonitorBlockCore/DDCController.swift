@@ -97,6 +97,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
                 index: idx,
                 name: item.name,
                 serialNumber: item.serialNumber,
+                numericSerial: item.numericSerial,
                 registryPath: item.registryPath
             )
         }
@@ -352,6 +353,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         let service: CFTypeRef
         let name: String
         let serialNumber: String?
+        let numericSerial: UInt32?
         let registryPath: String?
     }
 
@@ -394,7 +396,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
                 ResolvedAVService(
                     service: avService,
                     name: name,
-                    serialNumber: meta.serial,
+                    serialNumber: meta.alphaSerial ?? meta.numericSerial.map { String($0) },
+                    numericSerial: meta.numericSerial,
                     registryPath: resolveRegistryPath(for: entry)
                 )
             )
@@ -410,7 +413,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         return String(cString: pathBuffer)
     }
 
-    private func resolveDisplayMetadata(from entry: io_registry_entry_t) -> (name: String?, serial: String?) {
+    private func resolveDisplayMetadata(from entry: io_registry_entry_t) -> (name: String?, alphaSerial: String?, numericSerial: UInt32?) {
         var current = entry
         var shouldReleaseCurrent = false
         defer {
@@ -429,9 +432,9 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             let productAttrs = attrs["ProductAttributes"] as? [String: Any] {
                 let productName = (productAttrs["ProductName"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 let alphaSerial = (productAttrs["AlphanumericSerialNumber"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                let numSerial = (productAttrs["SerialNumber"] as? NSNumber)?.stringValue
-                if productName != nil || alphaSerial != nil || numSerial != nil {
-                    return (productName, alphaSerial ?? numSerial)
+                let numericSerial = (productAttrs["SerialNumber"] as? NSNumber).flatMap { $0.uint32Value != 0 ? $0.uint32Value : nil }
+                if productName != nil || alphaSerial != nil || numericSerial != nil {
+                    return (productName, alphaSerial, numericSerial)
                 }
             }
 
@@ -446,6 +449,6 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             current = parent
             shouldReleaseCurrent = true
         }
-        return (nil, nil)
+        return (nil, nil, nil)
     }
 }

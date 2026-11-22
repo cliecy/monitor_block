@@ -159,13 +159,7 @@ final class AppViewModel: ObservableObject {
         volumeTargetName = snapshot.deviceName
 
         ddcEndpoints = audioManager.listDDCEndpoints()
-        var mapping: [String: Int] = [:]
-        for display in displays where !display.isBuiltin && display.isEnabledForDisplay {
-            if let ep = audioManager.matchDDCEndpoint(for: display, allDisplays: displays, endpoints: ddcEndpoints) {
-                mapping[display.uuid] = ep.index
-            }
-        }
-        displayToDDCIndex = mapping
+        displayToDDCIndex = audioManager.matchAllDDCEndpoints(for: displays, endpoints: ddcEndpoints)
 
         for ep in ddcEndpoints {
             if let vol = ep.currentVolume {
@@ -736,9 +730,23 @@ final class AppViewModel: ObservableObject {
         refresh(readHardwareDDC: true)
     }
 
+    func bindDisplay(_ displayUUID: String, toDDCEndpoint endpoint: DDCDisplayEndpoint) {
+        audioManager.bindDisplay(displayUUID, toEndpoint: endpoint)
+        refresh(readHardwareDDC: true)
+        if let name = displays.first(where: { $0.uuid == displayUUID })?.name {
+            showBanner("已将「\(name)」绑定至硬件通道 #\(endpoint.index + 1)", isError: false)
+        }
+    }
+
     // MARK: - Formatting Helpers
 
     func displayTitle(for device: AudioOutputDevice) -> String {
+        if let epIdx = audioManager.matchedDDCEndpointIndex(for: device, allDevices: audioDevices),
+           let matchedUUID = displayToDDCIndex.first(where: { $0.value == epIdx })?.key,
+           let matchedDisplay = displays.first(where: { $0.uuid == matchedUUID }),
+           let custom = matchedDisplay.customName, !custom.isEmpty {
+            return "\(custom)（\(device.name)）"
+        }
         let sameName = audioDevices.filter { $0.name == device.name }
         guard sameName.count > 1,
               let idx = sameName.firstIndex(where: { $0.id == device.id }) else {

@@ -51,6 +51,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
     public var preDisableSnapshots: [String: [DisplayPlacement]]
     public var customNames: [String: String]
     public var audioToDDCBindings: [String: Int]
+    public var displayToDDCBindings: [String: String]
     public var calibratedInputCodes: [String: [String: DDCInputCode]]
 
     public init(
@@ -60,6 +61,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         preDisableSnapshots: [String: [DisplayPlacement]] = [:],
         customNames: [String: String] = [:],
         audioToDDCBindings: [String: Int] = [:],
+        displayToDDCBindings: [String: String] = [:],
         calibratedInputCodes: [String: [String: DDCInputCode]] = [:]
     ) {
         self.cachedDisplays = cachedDisplays
@@ -68,6 +70,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.preDisableSnapshots = preDisableSnapshots
         self.customNames = customNames
         self.audioToDDCBindings = audioToDDCBindings
+        self.displayToDDCBindings = displayToDDCBindings
         self.calibratedInputCodes = calibratedInputCodes
     }
 
@@ -78,6 +81,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         case preDisableSnapshots
         case customNames
         case audioToDDCBindings
+        case displayToDDCBindings
         case calibratedInputCodes
     }
 
@@ -89,6 +93,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.preDisableSnapshots = try container.decodeIfPresent([String: [DisplayPlacement]].self, forKey: .preDisableSnapshots) ?? [:]
         self.customNames = try container.decodeIfPresent([String: String].self, forKey: .customNames) ?? [:]
         self.audioToDDCBindings = try container.decodeIfPresent([String: Int].self, forKey: .audioToDDCBindings) ?? [:]
+        self.displayToDDCBindings = try container.decodeIfPresent([String: String].self, forKey: .displayToDDCBindings) ?? [:]
         self.calibratedInputCodes = try container.decodeIfPresent([String: [String: DDCInputCode]].self, forKey: .calibratedInputCodes) ?? [:]
     }
 }

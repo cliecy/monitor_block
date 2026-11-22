@@ -30,6 +30,7 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
     public let id: CGDirectDisplayID
     public let uuid: String
     public let serialNumber: String?
+    public let numericSerial: UInt32?
     public let name: String
     public let systemName: String
     public let customName: String?
@@ -49,6 +50,7 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         id: CGDirectDisplayID,
         uuid: String,
         serialNumber: String? = nil,
+        numericSerial: UInt32? = nil,
         name: String,
         systemName: String? = nil,
         customName: String? = nil,
@@ -67,6 +69,7 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         self.id = id
         self.uuid = uuid
         self.serialNumber = serialNumber
+        self.numericSerial = numericSerial
         self.name = name
         self.systemName = systemName ?? name
         self.customName = customName

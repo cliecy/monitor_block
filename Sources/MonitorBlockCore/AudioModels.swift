@@ -71,6 +71,7 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     public let index: Int
     public let name: String
     public let serialNumber: String?
+    public let numericSerial: UInt32?
     public let registryPath: String?
     public let currentVolume: Int?
     public let isMuted: Bool
@@ -78,6 +79,9 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     public var storageKey: String {
         if let serialNumber, !serialNumber.isEmpty {
             return "serial:\(serialNumber)"
+        }
+        if let numericSerial, numericSerial != 0 {
+            return "numserial:\(numericSerial)"
         }
         if let registryPath, !registryPath.isEmpty {
             return "path:\(registryPath)"
@@ -89,6 +93,7 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
         index: Int,
         name: String,
         serialNumber: String? = nil,
+        numericSerial: UInt32? = nil,
         registryPath: String? = nil,
         currentVolume: Int? = nil,
         isMuted: Bool = false
@@ -96,6 +101,7 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
         self.index = index
         self.name = name
         self.serialNumber = serialNumber
+        self.numericSerial = numericSerial
         self.registryPath = registryPath
         self.currentVolume = currentVolume
         self.isMuted = isMuted
