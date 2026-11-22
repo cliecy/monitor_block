@@ -1,6 +1,31 @@
 import CoreGraphics
 import Foundation
 
+public enum DisplayUsageMode: Equatable, Sendable {
+    case main
+    case extended
+    case mirrored(masterID: CGDirectDisplayID, masterUUID: String, masterName: String)
+    case disabled
+
+    public var isMirrored: Bool {
+        if case .mirrored = self { return true }
+        return false
+    }
+
+    public var isEnabled: Bool {
+        self != .disabled
+    }
+
+    public var shortLabel: String {
+        switch self {
+        case .main: return "主屏幕"
+        case .extended: return "拓展"
+        case .mirrored: return "镜像中"
+        case .disabled: return "已停用"
+        }
+    }
+}
+
 public struct DisplayInfo: Equatable, Identifiable, Sendable {
     public let id: CGDirectDisplayID
     public let uuid: String
@@ -16,6 +41,8 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
     public let width: Int
     public let height: Int
     public let isMain: Bool
+    public let mirrorMasterID: CGDirectDisplayID?
+    public let usageMode: DisplayUsageMode
     public let disabledByApp: Bool
 
     public init(
@@ -33,6 +60,8 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         width: Int,
         height: Int,
         isMain: Bool = false,
+        mirrorMasterID: CGDirectDisplayID? = nil,
+        usageMode: DisplayUsageMode? = nil,
         disabledByApp: Bool = false
     ) {
         self.id = id
@@ -49,7 +78,27 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         self.width = width
         self.height = height
         self.isMain = isMain
+        self.mirrorMasterID = mirrorMasterID
+        if let usageMode {
+            self.usageMode = usageMode
+        } else if disabledByApp || (!isActive && mirrorMasterID == nil) {
+            self.usageMode = .disabled
+        } else if let masterID = mirrorMasterID {
+            self.usageMode = .mirrored(masterID: masterID, masterUUID: "", masterName: "显示器 #\(masterID)")
+        } else if isMain {
+            self.usageMode = .main
+        } else {
+            self.usageMode = .extended
+        }
         self.disabledByApp = disabledByApp
+    }
+
+    public var isEnabledForDisplay: Bool {
+        usageMode.isEnabled
+    }
+
+    public var isIndependentActive: Bool {
+        usageMode == .main || usageMode == .extended
     }
 
     public var resolutionText: String? {
@@ -101,7 +150,7 @@ public struct LayoutPreset: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// 关闭某块外接显示器后自动应用的布局规则
+/// 关闭某块显示器后自动应用的布局规则
 public struct DisableLayoutRule: Codable, Equatable, Identifiable, Sendable {
     public var id: String { targetDisplayUUID }
     public let targetDisplayUUID: String
@@ -128,6 +177,9 @@ public enum MonitorBlockError: Error, LocalizedError, Equatable, Sendable {
     case displayUUIDNotFound(String)
     case cannotDisableLastActiveDisplay
     case cannotDisableBuiltinDisplay
+    case cannotMirrorDisplayToItself
+    case cannotUnsetOnlyMainDisplay
+    case invalidMirrorMaster(CGDirectDisplayID)
     case presetNotFound(UUID)
     case noMatchingActiveDisplaysForLayout
     case configurationFailed(Int32)
@@ -135,7 +187,7 @@ public enum MonitorBlockError: Error, LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .privateAPINotAvailable:
-            return "当前 macOS 系统不支持 CGSConfigureDisplayEnabled 私有显示控制接口，无法软断开外接显示器。"
+            return "当前 macOS 系统不支持 CGSConfigureDisplayEnabled 私有显示控制接口，无法软断开显示器。"
         case .displayNotFound(let id):
             return "未找到指定的显示器（ID: \(id)），可能已被拔出。"
         case .displayUUIDNotFound(let uuid):
@@ -144,6 +196,12 @@ public enum MonitorBlockError: Error, LocalizedError, Equatable, Sendable {
             return "无法停用最后一块活跃屏幕，已自动拦截以防止全黑锁死。"
         case .cannotDisableBuiltinDisplay:
             return "为防止误操作，当前不允许停用内置显示器。"
+        case .cannotMirrorDisplayToItself:
+            return "不能将显示器镜像到它自身。"
+        case .cannotUnsetOnlyMainDisplay:
+            return "当前只有一块独立活跃屏幕，无法取消其主屏幕身份。"
+        case .invalidMirrorMaster(let id):
+            return "所选镜像源屏幕（ID: \(id)）当前不可用或已停用。"
         case .presetNotFound:
             return "未找到指定的布局预设。"
         case .noMatchingActiveDisplaysForLayout:

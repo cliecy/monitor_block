@@ -47,12 +47,11 @@ public final class DisplayManager {
     public func listDisplays(includeBuiltin: Bool = false) -> [DisplayInfo] {
         let snapshots = backend.fetchDisplays()
         var liveIDs = Set<CGDirectDisplayID>()
-        var results: [DisplayInfo] = []
         var cacheChanged = false
 
+        // 第一遍：计算每块在线屏幕的显示名称与 UUID，供镜像从属屏解析 masterName
+        var resolvedMetaByID: [CGDirectDisplayID: (uuid: String, name: String, systemName: String, customName: String?)] = [:]
         for snap in snapshots {
-            liveIDs.insert(snap.id)
-
             let existing = cache[snap.id]
             let systemName: String
             if let name = snap.name, !name.isEmpty {
@@ -64,15 +63,24 @@ public final class DisplayManager {
             } else {
                 systemName = "外接显示器 #\(snap.id)"
             }
-
             let customName = customNames[snap.uuid]
             let resolvedName = customName ?? systemName
+            resolvedMetaByID[snap.id] = (snap.uuid, resolvedName, systemName, customName)
+        }
+
+        var results: [DisplayInfo] = []
+
+        for snap in snapshots {
+            liveIDs.insert(snap.id)
+            let existing = cache[snap.id]
+            let meta = resolvedMetaByID[snap.id]!
 
             let resolvedWidth = snap.width > 0 ? snap.width : (existing?.width ?? 0)
             let resolvedHeight = snap.height > 0 ? snap.height : (existing?.height ?? 0)
 
+            let isLiveEnabled = snap.isActive || snap.mirrorMasterID != nil
             var disabledByApp = existing?.disabledByApp ?? false
-            if snap.isActive && disabledByApp {
+            if isLiveEnabled && disabledByApp {
                 disabledByApp = false
                 cacheChanged = true
             }
@@ -80,7 +88,7 @@ public final class DisplayManager {
             let updated = CachedDisplayRecord(
                 id: snap.id,
                 uuid: snap.uuid,
-                name: systemName,
+                name: meta.systemName,
                 width: resolvedWidth,
                 height: resolvedHeight,
                 disabledByApp: disabledByApp,
@@ -91,15 +99,31 @@ public final class DisplayManager {
                 cacheChanged = true
             }
 
+            let usageMode: DisplayUsageMode
+            if disabledByApp || !isLiveEnabled {
+                usageMode = .disabled
+            } else if let masterID = snap.mirrorMasterID {
+                let masterMeta = resolvedMetaByID[masterID]
+                usageMode = .mirrored(
+                    masterID: masterID,
+                    masterUUID: masterMeta?.uuid ?? "",
+                    masterName: masterMeta?.name ?? "显示器 #\(masterID)"
+                )
+            } else if snap.isMain {
+                usageMode = .main
+            } else {
+                usageMode = .extended
+            }
+
             if includeBuiltin || !snap.isBuiltin {
                 results.append(
                     DisplayInfo(
                         id: snap.id,
                         uuid: snap.uuid,
                         serialNumber: snap.serialNumber,
-                        name: resolvedName,
-                        systemName: systemName,
-                        customName: customName,
+                        name: meta.name,
+                        systemName: meta.systemName,
+                        customName: meta.customName,
                         isBuiltin: snap.isBuiltin,
                         isActive: snap.isActive,
                         isOnline: snap.isOnline,
@@ -107,13 +131,16 @@ public final class DisplayManager {
                         originY: snap.originY,
                         width: resolvedWidth,
                         height: resolvedHeight,
-                        isMain: snap.isMain,
+                        isMain: usageMode == .main,
+                        mirrorMasterID: snap.mirrorMasterID,
+                        usageMode: usageMode,
                         disabledByApp: disabledByApp
                     )
                 )
             }
         }
 
+        // 将被本工具软断开后从系统在线列表中消失的显示器合并回来，方便一键恢复
         for (id, record) in cache where record.disabledByApp && !liveIDs.contains(id) {
             if !includeBuiltin && record.isBuiltin {
                 continue
@@ -134,6 +161,8 @@ public final class DisplayManager {
                     width: record.width,
                     height: record.height,
                     isMain: false,
+                    mirrorMasterID: nil,
+                    usageMode: .disabled,
                     disabledByApp: true
                 )
             )
@@ -156,7 +185,7 @@ public final class DisplayManager {
 
     // MARK: - Enable / Disable with Layout Rules
 
-    /// 启用或停用任意显示器（支持内置屏与外接屏，但严格禁止停用最后一块活跃屏）
+    /// 启用或停用任意显示器（支持内置屏与外接屏，但严格禁止停用最后一块独立活跃屏）
     public func setDisplay(id: CGDirectDisplayID, enabled: Bool) throws {
         let allDisplays = listDisplays(includeBuiltin: true)
         guard let target = allDisplays.first(where: { $0.id == id }) else {
@@ -164,14 +193,25 @@ public final class DisplayManager {
         }
 
         if !enabled {
-            let activeCount = allDisplays.filter(\.isActive).count
-            if target.isActive && activeCount <= 1 {
+            let independentActive = allDisplays.filter(\.isIndependentActive)
+            if target.isIndependentActive && independentActive.count <= 1 {
                 throw MonitorBlockError.cannotDisableLastActiveDisplay
             }
+
             // 关闭前自动保存完整布局快照，供后续恢复
             let currentSnapshot = captureCurrentLayout(from: allDisplays)
             if !currentSnapshot.isEmpty {
                 preDisableSnapshots[target.uuid] = currentSnapshot
+            }
+
+            // 如果目标屏正处于镜像从属态，先解除镜像再软断开
+            if target.usageMode.isMirrored {
+                try backend.setMirroring(displayID: id, masterID: nil, option: .forSession)
+            }
+
+            // 如果有其他屏正在镜像本目标屏，先解除它们的镜像关系防止异常黑屏
+            for follower in allDisplays where follower.mirrorMasterID == id {
+                try backend.setMirroring(displayID: follower.id, masterID: nil, option: .forSession)
             }
         }
 
@@ -192,12 +232,10 @@ public final class DisplayManager {
         persist()
 
         if !enabled {
-            // 如果为该屏幕配置了“关闭后布局规则”，自动应用到剩余活跃屏幕
             if let rule = disableRules[target.uuid], !rule.layoutOnDisable.isEmpty {
                 try? applyLayout(rule.layoutOnDisable)
             }
         } else {
-            // 如果开启了“重新启用时恢复原布局”，则自动还原关闭前的布局
             let shouldRestore = disableRules[target.uuid]?.restorePreviousOnEnable ?? true
             if shouldRestore, let snapshot = preDisableSnapshots[target.uuid], !snapshot.isEmpty {
                 try? applyLayout(snapshot)
@@ -211,13 +249,114 @@ public final class DisplayManager {
         try setDisplay(id: id, enabled: enabled)
     }
 
+    // MARK: - Usage Mode Switching (Main / Extended / Mirrored)
+
+    /// 将指定显示器设为「主屏幕」（带菜单栏/Dock）
+    public func setAsMainDisplay(id: CGDirectDisplayID) throws {
+        let allDisplays = listDisplays(includeBuiltin: true)
+        guard let target = allDisplays.first(where: { $0.id == id }) else {
+            throw MonitorBlockError.displayNotFound(id)
+        }
+
+        if target.usageMode == .disabled {
+            try setDisplay(id: id, enabled: true)
+        }
+        if target.usageMode.isMirrored {
+            try backend.setMirroring(displayID: id, masterID: nil, option: .forSession)
+        }
+
+        // 重新读取当前独立活跃布局并将目标屏归一化至 (0, 0)
+        try setMainDisplay(uuid: target.uuid)
+    }
+
+    /// 将指定显示器设为「拓展显示器」（独立非主屏桌面）
+    public func setAsExtendedDisplay(id: CGDirectDisplayID) throws {
+        let allDisplays = listDisplays(includeBuiltin: true)
+        guard let target = allDisplays.first(where: { $0.id == id }) else {
+            throw MonitorBlockError.displayNotFound(id)
+        }
+
+        if target.usageMode == .disabled {
+            try setDisplay(id: id, enabled: true)
+            return
+        }
+
+        if target.usageMode.isMirrored {
+            try backend.setMirroring(displayID: id, masterID: nil, option: .forSession)
+            return
+        }
+
+        if target.usageMode == .extended {
+            return
+        }
+
+        // 目标当前是主屏：将另一块独立活跃屏（优先内置屏）提升为主屏，使目标变为拓展屏
+        let otherIndependents = allDisplays.filter { $0.id != id && $0.isIndependentActive }
+        guard let nextMain = otherIndependents.first(where: \.isBuiltin) ?? otherIndependents.first else {
+            throw MonitorBlockError.cannotUnsetOnlyMainDisplay
+        }
+        try setMainDisplay(uuid: nextMain.uuid)
+    }
+
+    /// 将指定显示器设为「镜像屏幕」，镜像目标源显示器 masterID
+    public func setMirrorDisplay(id: CGDirectDisplayID, masterID: CGDirectDisplayID) throws {
+        guard id != masterID else {
+            throw MonitorBlockError.cannotMirrorDisplayToItself
+        }
+
+        let allDisplays = listDisplays(includeBuiltin: true)
+        guard let target = allDisplays.first(where: { $0.id == id }) else {
+            throw MonitorBlockError.displayNotFound(id)
+        }
+        guard let rawMaster = allDisplays.first(where: { $0.id == masterID }),
+              rawMaster.isEnabledForDisplay else {
+            throw MonitorBlockError.invalidMirrorMaster(masterID)
+        }
+
+        // 如果选中的源屏幕本身正在镜像别的屏幕，自动追踪到其根源屏幕，避免链式镜像失败
+        let resolvedMasterID = rawMaster.mirrorMasterID ?? rawMaster.id
+        guard resolvedMasterID != id else {
+            throw MonitorBlockError.cannotMirrorDisplayToItself
+        }
+
+        if target.usageMode == .disabled {
+            try setDisplay(id: id, enabled: true)
+        }
+
+        // 如果有其他屏幕正在镜像 target，先转到 resolvedMasterID 或解除，防止循环依赖
+        for follower in allDisplays where follower.mirrorMasterID == id && follower.id != resolvedMasterID {
+            try backend.setMirroring(displayID: follower.id, masterID: resolvedMasterID, option: .forSession)
+        }
+
+        // 如果目标屏当前是主屏，先将 resolvedMasterID 提升为主屏，保证切换平滑
+        if target.usageMode == .main,
+           let masterInfo = listDisplays(includeBuiltin: true).first(where: { $0.id == resolvedMasterID }),
+           masterInfo.isIndependentActive {
+            try? setMainDisplay(uuid: masterInfo.uuid)
+        }
+
+        try backend.setMirroring(displayID: id, masterID: resolvedMasterID, option: .forSession)
+    }
+
+    /// 一键取消所有屏幕的镜像关系，全部恢复为独立拓展屏
+    @discardableResult
+    public func stopAllMirroring() throws -> [CGDirectDisplayID] {
+        let mirrored = listDisplays(includeBuiltin: true).filter { $0.usageMode.isMirrored }
+        var unmirrored: [CGDirectDisplayID] = []
+        for display in mirrored {
+            try backend.setMirroring(displayID: display.id, masterID: nil, option: .forSession)
+            unmirrored.append(display.id)
+        }
+        return unmirrored
+    }
+
     /// 紧急安全兜底：如果所有外接屏都断开/不可用，且内置屏处于被停用状态，立即恢复内置屏防止黑屏锁死
     public func ensureBuiltinActiveIfNoExternalActive() {
         let allDisplays = listDisplays(includeBuiltin: true)
-        let activeExternals = allDisplays.filter { !$0.isBuiltin && $0.isActive }
-        guard activeExternals.isEmpty else { return }
+        let enabledExternals = allDisplays.filter { !$0.isBuiltin && $0.isEnabledForDisplay }
+        guard enabledExternals.isEmpty else { return }
 
-        let disabledBuiltins = allDisplays.filter { $0.isBuiltin && (!$0.isActive || $0.disabledByApp) }
+        let disabledBuiltins = allDisplays.filter { $0.isBuiltin && $0.usageMode == .disabled }
         for builtin in disabledBuiltins {
             try? setDisplay(id: builtin.id, enabled: true)
         }
@@ -227,7 +366,7 @@ public final class DisplayManager {
     @discardableResult
     public func enableAllDisplays() throws -> [CGDirectDisplayID] {
         let all = listDisplays(includeBuiltin: true)
-        let toEnable = all.filter { !$0.isActive || $0.disabledByApp }
+        let toEnable = all.filter { $0.usageMode == .disabled || $0.disabledByApp }
         var enabledIDs: [CGDirectDisplayID] = []
         var firstError: Error?
 
@@ -253,29 +392,29 @@ public final class DisplayManager {
         return enabledIDs
     }
 
-    /// 切换指定显示器（内置或外接）状态
+    /// 切换指定显示器（内置或外接）开关状态
     public func toggleDisplay(id: CGDirectDisplayID) throws {
         let displays = listDisplays(includeBuiltin: true)
         guard let target = displays.first(where: { $0.id == id }) else {
             throw MonitorBlockError.displayNotFound(id)
         }
-        try setDisplay(id: id, enabled: !target.isActive)
+        try setDisplay(id: id, enabled: !target.isEnabledForDisplay)
     }
 
     @discardableResult
     public func disableAllExternal() throws -> [CGDirectDisplayID] {
         let allDisplays = listDisplays(includeBuiltin: true)
-        let externalsToDisable = allDisplays.filter { !$0.isBuiltin && $0.isActive }
+        let externalsToDisable = allDisplays.filter { !$0.isBuiltin && $0.isEnabledForDisplay }
         guard !externalsToDisable.isEmpty else { return [] }
 
-        let activeBuiltinCount = allDisplays.filter { $0.isBuiltin && $0.isActive }.count
+        let activeBuiltinCount = allDisplays.filter { $0.isBuiltin && $0.isIndependentActive }.count
         if activeBuiltinCount == 0 {
             throw MonitorBlockError.cannotDisableLastActiveDisplay
         }
 
         var disabledIDs: [CGDirectDisplayID] = []
         for display in externalsToDisable {
-            try setExternalDisplay(id: display.id, enabled: false)
+            try setDisplay(id: display.id, enabled: false)
             disabledIDs.append(display.id)
         }
         return disabledIDs
@@ -284,13 +423,13 @@ public final class DisplayManager {
     @discardableResult
     public func enableAllExternal() throws -> [CGDirectDisplayID] {
         let externals = listDisplays(includeBuiltin: false)
-        let toEnable = externals.filter { !$0.isActive || $0.disabledByApp }
+        let toEnable = externals.filter { $0.usageMode == .disabled || $0.disabledByApp }
         var enabledIDs: [CGDirectDisplayID] = []
         var firstError: Error?
 
         for display in toEnable {
             do {
-                try setExternalDisplay(id: display.id, enabled: true)
+                try setDisplay(id: display.id, enabled: true)
                 enabledIDs.append(display.id)
             } catch {
                 if var record = cache[display.id] {
@@ -316,13 +455,13 @@ public final class DisplayManager {
             guard let target = displays.first(where: { $0.id == id }) else {
                 throw MonitorBlockError.displayNotFound(id)
             }
-            try setExternalDisplay(id: id, enabled: !target.isActive)
+            try setDisplay(id: id, enabled: !target.isEnabledForDisplay)
             return
         }
 
         let externals = listDisplays(includeBuiltin: false)
-        let hasActiveExternal = externals.contains(where: \.isActive)
-        if hasActiveExternal {
+        let hasEnabledExternal = externals.contains(where: \.isEnabledForDisplay)
+        if hasEnabledExternal {
             try disableAllExternal()
         } else {
             try enableAllExternal()
@@ -337,7 +476,7 @@ public final class DisplayManager {
 
     private func captureCurrentLayout(from displays: [DisplayInfo]) -> [DisplayPlacement] {
         displays
-            .filter(\.isActive)
+            .filter(\.isIndependentActive)
             .map {
                 DisplayPlacement(
                     uuid: $0.uuid,
@@ -351,9 +490,9 @@ public final class DisplayManager {
             }
     }
 
-    /// 将一组布局坐标归一化（主屏归零至 (0,0)）并应用到当前匹配的活跃显示器
+    /// 将一组布局坐标归一化（主屏归零至 (0,0)）并应用到当前匹配的独立活跃显示器
     public func applyLayout(_ placements: [DisplayPlacement]) throws {
-        let activeDisplays = listDisplays(includeBuiltin: true).filter(\.isActive)
+        let activeDisplays = listDisplays(includeBuiltin: true).filter(\.isIndependentActive)
         let byUUID = Dictionary(uniqueKeysWithValues: activeDisplays.map { ($0.uuid, $0) })
 
         let matched = placements.compactMap { placement -> (DisplayPlacement, DisplayInfo)? in
@@ -365,7 +504,6 @@ public final class DisplayManager {
             throw MonitorBlockError.noMatchingActiveDisplaysForLayout
         }
 
-        // 选择主屏作为坐标原点 (0, 0)
         let mainEntry = matched.first(where: { $0.0.isMain }) ?? matched[0]
         let offsetX = mainEntry.0.x
         let offsetY = mainEntry.0.y
@@ -381,7 +519,7 @@ public final class DisplayManager {
         try backend.applyLayout(updates, option: .forSession)
     }
 
-    /// 将指定 UUID 的活跃显示器设为主屏，其余屏幕保持原有相对位置
+    /// 将指定 UUID 的独立活跃显示器设为主屏，其余屏幕保持原有相对位置
     public func setMainDisplay(uuid: String) throws {
         var current = captureCurrentLayout()
         guard let idx = current.firstIndex(where: { $0.uuid == uuid }) else {

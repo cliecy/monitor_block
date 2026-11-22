@@ -14,10 +14,17 @@ private final class MockDisplayBackend: DisplayBackend {
         let option: CGConfigureOption
     }
 
+    struct MirrorCall: Equatable {
+        let displayID: CGDirectDisplayID
+        let masterID: CGDirectDisplayID?
+        let option: CGConfigureOption
+    }
+
     var isPrivateAPIAvailable: Bool = true
     var displays: [RawDisplaySnapshot] = []
     var calls: [ToggleCall] = []
     var layoutCalls: [LayoutCall] = []
+    var mirrorCalls: [MirrorCall] = []
     var errorToThrow: Error?
     var hideDisplayWhenDisabled: Bool = false
 
@@ -88,6 +95,7 @@ private final class MockDisplayBackend: DisplayBackend {
                 displays[index] = RawDisplaySnapshot(
                     id: old.id,
                     uuid: old.uuid,
+                    serialNumber: old.serialNumber,
                     name: old.name,
                     isBuiltin: old.isBuiltin,
                     isActive: old.isActive,
@@ -96,9 +104,41 @@ private final class MockDisplayBackend: DisplayBackend {
                     originY: Int(update.y),
                     width: old.width,
                     height: old.height,
-                    isMain: (update.x == 0 && update.y == 0)
+                    isMain: (update.x == 0 && update.y == 0),
+                    mirrorMasterID: old.mirrorMasterID
                 )
             }
+        }
+    }
+
+    func setMirroring(
+        displayID: CGDirectDisplayID,
+        masterID: CGDirectDisplayID?,
+        option: CGConfigureOption
+    ) throws {
+        mirrorCalls.append(MirrorCall(displayID: displayID, masterID: masterID, option: option))
+        if let errorToThrow {
+            throw errorToThrow
+        }
+        if let index = displays.firstIndex(where: { $0.id == displayID }) {
+            let old = displays[index]
+            // 在真实 macOS 中，镜像从属屏不在 ActiveDisplayList 中（isActive = false），但 online 且 mirrorMasterID != nil
+            let becomingMirrored = (masterID != nil)
+            displays[index] = RawDisplaySnapshot(
+                id: old.id,
+                uuid: old.uuid,
+                serialNumber: old.serialNumber,
+                name: old.name,
+                isBuiltin: old.isBuiltin,
+                isActive: !becomingMirrored,
+                isOnline: true,
+                originX: old.originX,
+                originY: old.originY,
+                width: old.width,
+                height: old.height,
+                isMain: becomingMirrored ? false : old.isMain,
+                mirrorMasterID: masterID
+            )
         }
     }
 
@@ -392,5 +432,70 @@ struct DisplayManagerTests {
 
         manager.deletePreset(id: preset.id)
         #expect(manager.listPresets().isEmpty)
+    }
+
+    @Test("每台显示器独立切换主屏幕、拓展显示器与镜像屏幕模式")
+    func switchDisplayBetweenMainExtendedAndMirrored() throws {
+        let backend = MockDisplayBackend()
+        backend.displays = [
+            makeBuiltin(id: 1, x: 0, y: 0, isMain: true),
+            makeExternal(id: 2, name: "LG Left", x: 1512, y: 0, isMain: false),
+            makeExternal(id: 3, name: "LG Right", x: 4072, y: 0, isMain: false)
+        ]
+        let manager = DisplayManager(backend: backend, store: InMemoryStateStore())
+
+        // 1. 将右 LG 镜像到左 LG
+        try manager.setMirrorDisplay(id: 3, masterID: 2)
+        #expect(backend.mirrorCalls.last == MockDisplayBackend.MirrorCall(displayID: 3, masterID: 2, option: .forSession))
+
+        let afterMirror = manager.listDisplays(includeBuiltin: true)
+        let mirroredRight = try #require(afterMirror.first(where: { $0.id == 3 }))
+        #expect(mirroredRight.usageMode == .mirrored(masterID: 2, masterUUID: "ext-uuid-2", masterName: "LG Left"))
+        #expect(mirroredRight.isEnabledForDisplay == true)
+
+        // 2. 将镜像中的右 LG 直接设为主屏幕 -> 自动先解除镜像再设为主屏 (0, 0)
+        try manager.setAsMainDisplay(id: 3)
+        #expect(backend.mirrorCalls.last == MockDisplayBackend.MirrorCall(displayID: 3, masterID: nil, option: .forSession))
+        #expect(backend.layoutCalls.last?.updates.first(where: { $0.displayID == 3 }) == DisplayOriginUpdate(displayID: 3, x: 0, y: 0))
+
+        // 3. 将当前主屏右 LG 改为拓展显示器 -> 自动将内置屏提升为主屏
+        try manager.setAsExtendedDisplay(id: 3)
+        let afterExtended = manager.listDisplays(includeBuiltin: true)
+        #expect(afterExtended.first(where: { $0.id == 1 })?.usageMode == .main)
+        #expect(afterExtended.first(where: { $0.id == 3 })?.usageMode == .extended)
+    }
+
+    @Test("禁止自镜像、禁止取消唯一主屏身份，且停用镜像从属屏时先解除镜像")
+    func mirrorSafetyGuardsAndStopAllMirroring() throws {
+        let backend = MockDisplayBackend()
+        backend.displays = [
+            makeBuiltin(id: 1, x: 0, y: 0, isMain: true),
+            makeExternal(id: 2, name: "LG", x: 1512, y: 0, isMain: false)
+        ]
+        let manager = DisplayManager(backend: backend, store: InMemoryStateStore())
+
+        // 禁止镜像自己
+        #expect(throws: MonitorBlockError.cannotMirrorDisplayToItself) {
+            try manager.setMirrorDisplay(id: 2, masterID: 2)
+        }
+
+        // 设为镜像后，内置屏是唯一独立主屏 -> 禁止将内置屏改为拓展
+        try manager.setMirrorDisplay(id: 2, masterID: 1)
+        #expect(throws: MonitorBlockError.cannotUnsetOnlyMainDisplay) {
+            try manager.setAsExtendedDisplay(id: 1)
+        }
+
+        // 停用镜像从属屏 2 -> 应先解除镜像再软断开，不误触发最后一块屏拦截
+        try manager.setDisplay(id: 2, enabled: false)
+        #expect(backend.mirrorCalls.last == MockDisplayBackend.MirrorCall(displayID: 2, masterID: nil, option: .forSession))
+        #expect(backend.calls.last?.displayID == 2)
+        #expect(backend.calls.last?.enabled == false)
+
+        // 重新启用并再次镜像后，一键取消全部镜像
+        try manager.setDisplay(id: 2, enabled: true)
+        try manager.setMirrorDisplay(id: 2, masterID: 1)
+        let unmirrored = try manager.stopAllMirroring()
+        #expect(unmirrored == [2])
+        #expect(manager.listDisplays(includeBuiltin: true).allSatisfy { !$0.usageMode.isMirrored })
     }
 }

@@ -14,8 +14,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
-    private var popoverViewModel: MenuBarPopoverViewModel!
-    private var layoutEditorController: LayoutEditorWindowController?
+    private var appViewModel: AppViewModel!
+    private var mainWindowController: MainAppWindowController?
     private var wakeObserver: NSObjectProtocol?
     private var pendingRefreshWorkItem: DispatchWorkItem?
 
@@ -41,14 +41,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        popoverViewModel = MenuBarPopoverViewModel(
+        appViewModel = AppViewModel(
             displayManager: displayManager,
             audioManager: audioManager,
             launchAtLogin: launchAtLogin,
             autoRestoreOnQuit: autoRestoreOnQuit,
-            onOpenLayoutEditor: { [weak self] in
+            onOpenMainWindow: { [weak self] section in
                 self?.popover.performClose(nil)
-                self?.openLayoutEditor()
+                self?.openMainWindow(section: section)
             },
             onPromptSavePreset: { [weak self] in
                 self?.popover.performClose(nil)
@@ -57,7 +57,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             onToggleAutoRestore: { [weak self] in
                 guard let self else { return }
                 self.autoRestoreOnQuit.toggle()
-                self.popoverViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+                self.appViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
             },
             onQuit: {
                 NSApp.terminate(nil)
@@ -71,7 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.animates = true
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: MenuBarPopoverView(viewModel: popoverViewModel)
+            rootView: MenuBarPopoverView(viewModel: appViewModel)
         )
 
         updateStatusIcon()
@@ -99,6 +99,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    /// 当应用已在菜单栏常驻时，用户再次从 Finder / Spotlight 打开 MonitorBlock.app 直接唤出独立桌面主窗口
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openMainWindow(section: nil)
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         displayManager.stopObservingReconfiguration()
         audioManager.stopObservingChanges()
@@ -117,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            popoverViewModel.refresh(readHardwareDDC: true, autoRestoreValue: autoRestoreOnQuit)
+            appViewModel.refresh(readHardwareDDC: true, autoRestoreValue: autoRestoreOnQuit)
             updateStatusIcon()
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
@@ -134,8 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self.displayManager.ensureBuiltinActiveIfNoExternalActive()
             }
             self.updateStatusIcon()
-            if self.popover.isShown {
-                self.popoverViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+            let isMainWindowVisible = self.mainWindowController?.window?.isVisible ?? false
+            if self.popover.isShown || isMainWindowVisible {
+                self.appViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
             }
         }
         pendingRefreshWorkItem = workItem
@@ -146,7 +153,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let button = statusItem.button else { return }
         let displays = displayManager.listDisplays(includeBuiltin: true)
         let externals = displays.filter { !$0.isBuiltin }
-        let activeCount = displays.filter(\.isActive).count
+        let enabledCount = displays.filter(\.isEnabledForDisplay).count
+        let mirroredCount = displays.filter { $0.usageMode.isMirrored }.count
 
         let symbolName: String
         let tooltip: String
@@ -154,10 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if externals.isEmpty {
             symbolName = "laptopcomputer"
             tooltip = "MonitorBlock：仅内置显示器"
-        } else if activeCount > 1 {
+        } else if mirroredCount > 0 {
+            symbolName = "rectangle.on.rectangle"
+            tooltip = "MonitorBlock：多屏镜像中（\(enabledCount) 块活跃）"
+        } else if enabledCount > 1 {
             symbolName = "display.2"
-            tooltip = "MonitorBlock：多屏使用中（\(activeCount) 块活跃）"
-        } else if externals.contains(where: \.isActive) {
+            tooltip = "MonitorBlock：多屏拓展中（\(enabledCount) 块活跃）"
+        } else if externals.contains(where: \.isEnabledForDisplay) {
             symbolName = "display"
             tooltip = "MonitorBlock：仅外接显示器使用中（内置屏已停用）"
         } else {
@@ -171,15 +182,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         button.toolTip = tooltip
     }
 
-    // MARK: - Secondary Windows & Prompts
+    // MARK: - Main Desktop Window & Prompts
 
-    private func openLayoutEditor() {
-        if layoutEditorController == nil {
-            layoutEditorController = LayoutEditorWindowController(manager: displayManager) { [weak self] in
-                self?.scheduleRefresh(delay: 0.2, checkSafetyFallback: false)
-            }
+    private func openMainWindow(section: AppViewModel.MainWindowSection?) {
+        if mainWindowController == nil {
+            mainWindowController = MainAppWindowController(viewModel: appViewModel)
         }
-        layoutEditorController?.showAndRefresh()
+        mainWindowController?.showAndActivate(section: section)
     }
 
     private func promptSaveCurrentPreset() {
@@ -196,7 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         if alert.runModal() == .alertFirstButtonReturn {
             displayManager.savePreset(name: input.stringValue)
-            popoverViewModel.refresh(readHardwareDDC: false)
+            appViewModel.refresh(readHardwareDDC: false)
         }
     }
 }

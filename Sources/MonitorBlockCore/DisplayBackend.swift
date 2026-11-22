@@ -16,6 +16,7 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
     public let width: Int
     public let height: Int
     public let isMain: Bool
+    public let mirrorMasterID: CGDirectDisplayID?
 
     public init(
         id: CGDirectDisplayID,
@@ -29,7 +30,8 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
         originY: Int = 0,
         width: Int,
         height: Int,
-        isMain: Bool = false
+        isMain: Bool = false,
+        mirrorMasterID: CGDirectDisplayID? = nil
     ) {
         self.id = id
         self.uuid = uuid
@@ -43,6 +45,7 @@ public struct RawDisplaySnapshot: Equatable, Sendable {
         self.width = width
         self.height = height
         self.isMain = isMain
+        self.mirrorMasterID = mirrorMasterID
     }
 }
 
@@ -68,6 +71,11 @@ public protocol DisplayBackend: AnyObject {
     ) throws
     func applyLayout(
         _ updates: [DisplayOriginUpdate],
+        option: CGConfigureOption
+    ) throws
+    func setMirroring(
+        displayID: CGDirectDisplayID,
+        masterID: CGDirectDisplayID?,
         option: CGConfigureOption
     ) throws
     func startObservingReconfiguration(_ handler: @escaping @Sendable () -> Void)
@@ -213,6 +221,11 @@ public final class CoreGraphicsBackend: DisplayBackend {
                 height = CGDisplayPixelsHigh(id)
             }
 
+            let rawMirrorMaster = CGDisplayMirrorsDisplay(id)
+            let mirrorMasterID: CGDirectDisplayID? = (rawMirrorMaster != kCGNullDirectDisplay && rawMirrorMaster != id)
+                ? rawMirrorMaster
+                : nil
+
             return RawDisplaySnapshot(
                 id: id,
                 uuid: uuid,
@@ -225,7 +238,8 @@ public final class CoreGraphicsBackend: DisplayBackend {
                 originY: originY,
                 width: width,
                 height: height,
-                isMain: isActive && (id == mainID || (originX == 0 && originY == 0))
+                isMain: isActive && mirrorMasterID == nil && (id == mainID || (originX == 0 && originY == 0)),
+                mirrorMasterID: mirrorMasterID
             )
         }
     }
@@ -276,6 +290,31 @@ public final class CoreGraphicsBackend: DisplayBackend {
                 CGCancelDisplayConfiguration(config)
                 throw MonitorBlockError.configurationFailed(err.rawValue)
             }
+        }
+
+        let completeErr = CGCompleteDisplayConfiguration(config, option)
+        guard completeErr == .success else {
+            CGCancelDisplayConfiguration(config)
+            throw MonitorBlockError.configurationFailed(completeErr.rawValue)
+        }
+    }
+
+    public func setMirroring(
+        displayID: CGDirectDisplayID,
+        masterID: CGDirectDisplayID?,
+        option: CGConfigureOption
+    ) throws {
+        var configRef: CGDisplayConfigRef?
+        let beginErr = CGBeginDisplayConfiguration(&configRef)
+        guard beginErr == .success, let config = configRef else {
+            throw MonitorBlockError.configurationFailed(beginErr.rawValue)
+        }
+
+        let targetMaster = masterID ?? kCGNullDirectDisplay
+        let mirrorErr = CGConfigureDisplayMirrorOfDisplay(config, displayID, targetMaster)
+        guard mirrorErr == .success else {
+            CGCancelDisplayConfiguration(config)
+            throw MonitorBlockError.configurationFailed(mirrorErr.rawValue)
         }
 
         let completeErr = CGCompleteDisplayConfiguration(config, option)
