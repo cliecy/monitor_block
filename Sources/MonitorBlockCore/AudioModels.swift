@@ -92,6 +92,30 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     }
 }
 
+public enum InputSourceProtocolMode: String, CaseIterable, Codable, Identifiable, Equatable, Sendable {
+    case auto
+    case standard
+    case lgAlt
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .auto: return "自动 (标准+LG)"
+        case .standard: return "标准 0x60"
+        case .lgAlt: return "LG 0xF4"
+        }
+    }
+
+    public var next: InputSourceProtocolMode {
+        switch self {
+        case .auto: return .standard
+        case .standard: return .lgAlt
+        case .lgAlt: return .auto
+        }
+    }
+}
+
 public enum DisplayInputSource: String, CaseIterable, Identifiable, Equatable, Sendable {
     case hdmi1
     case hdmi2

@@ -573,8 +573,12 @@ public final class AudioManager {
     }
 
     @discardableResult
-    public func setDisplayInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
-        ddcBackend.setInputSource(source, endpointIndex: endpointIndex)
+    public func setDisplayInputSource(
+        _ source: DisplayInputSource,
+        endpointIndex: Int,
+        protocolMode: InputSourceProtocolMode = .auto
+    ) -> Bool {
+        ddcBackend.setInputSource(source, endpointIndex: endpointIndex, protocolMode: protocolMode)
     }
 
     public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {

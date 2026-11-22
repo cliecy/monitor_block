@@ -60,7 +60,7 @@ private final class MockDDCBackend: DDCBackend {
     var hardwareVolumes: [Int: Int] = [:]
     var setVolumeCalls: [(index: Int, volume: Int)] = []
     var setMuteCalls: [(index: Int, muted: Bool)] = []
-    var setInputCalls: [(index: Int, source: DisplayInputSource)] = []
+    var setInputCalls: [(index: Int, source: DisplayInputSource, mode: InputSourceProtocolMode)] = []
     var muteSupported: Bool = true
 
     func listEndpoints() -> [DDCDisplayEndpoint] {
@@ -82,8 +82,12 @@ private final class MockDDCBackend: DDCBackend {
         return muteSupported
     }
 
-    func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
-        setInputCalls.append((endpointIndex, source))
+    func setInputSource(
+        _ source: DisplayInputSource,
+        endpointIndex: Int,
+        protocolMode: InputSourceProtocolMode
+    ) -> Bool {
+        setInputCalls.append((endpointIndex, source, protocolMode))
         return true
     }
 }
@@ -242,14 +246,16 @@ struct AudioManagerTests {
         ]
         let manager = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: InMemoryStateStore())
 
-        #expect(manager.setDisplayInputSource(.hdmi1, endpointIndex: 0) == true)
-        #expect(manager.setDisplayInputSource(.usbC, endpointIndex: 1) == true)
+        #expect(manager.setDisplayInputSource(.hdmi1, endpointIndex: 0, protocolMode: .auto) == true)
+        #expect(manager.setDisplayInputSource(.usbC, endpointIndex: 1, protocolMode: .standard) == true)
 
         #expect(ddc.setInputCalls.count == 2)
         #expect(ddc.setInputCalls[0].index == 0)
         #expect(ddc.setInputCalls[0].source == .hdmi1)
+        #expect(ddc.setInputCalls[0].mode == .auto)
         #expect(ddc.setInputCalls[1].index == 1)
         #expect(ddc.setInputCalls[1].source == .usbC)
+        #expect(ddc.setInputCalls[1].mode == .standard)
 
         // 校验 LG 专有 VCP 0xF4 编码与标准 MCCS 0x60 编码
         #expect(DisplayInputSource.hdmi1.lgAltCode == 0x90)

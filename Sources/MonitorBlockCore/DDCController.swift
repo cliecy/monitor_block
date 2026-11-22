@@ -8,7 +8,11 @@ public protocol DDCBackend: AnyObject {
     func readVolume(endpointIndex: Int) -> Int?
     func setVolume(_ volume: Int, endpointIndex: Int) -> Bool
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool
-    func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool
+    func setInputSource(
+        _ source: DisplayInputSource,
+        endpointIndex: Int,
+        protocolMode: InputSourceProtocolMode
+    ) -> Bool
 }
 
 private typealias IOAVServiceCreateWithServiceFunc = @convention(c) (
@@ -150,42 +154,66 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         )
     }
 
-    public func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
+    public func setInputSource(
+        _ source: DisplayInputSource,
+        endpointIndex: Int,
+        protocolMode: InputSourceProtocolMode = .auto
+    ) -> Bool {
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return false }
         let target = services[endpointIndex]
-        let isLG = target.name.lowercased().contains("lg")
 
-        if isLG {
-            // 新款 LG 优先走专有 I2C 0x50 + VCP 0xF4，并补发标准 0x51 + VCP 0x60 兼容老款 LG
-            let altOK = writeVCP(
-                code: Self.vcpInputSelectLGAlt,
-                value: source.lgAltCode,
-                service: target.service,
-                dataAddress: Self.dataAddressLGAlt
-            )
-            usleep(25_000)
-            let stdOK = writeVCP(
+        switch protocolMode {
+        case .standard:
+            return writeVCP(
                 code: Self.vcpInputSelectStandard,
                 value: source.standardCode,
                 service: target.service,
                 dataAddress: Self.dataAddressStandard
             )
-            return altOK || stdOK
-        } else {
-            let stdOK = writeVCP(
-                code: Self.vcpInputSelectStandard,
-                value: source.standardCode,
-                service: target.service,
-                dataAddress: Self.dataAddressStandard
-            )
-            if stdOK { return true }
+
+        case .lgAlt:
             return writeVCP(
                 code: Self.vcpInputSelectLGAlt,
                 value: source.lgAltCode,
                 service: target.service,
                 dataAddress: Self.dataAddressLGAlt
             )
+
+        case .auto:
+            let isLG = target.name.lowercased().contains("lg")
+            if isLG {
+                // 新款 LG 优先走专有 I2C 0x50 + VCP 0xF4，并补发标准 0x51 + VCP 0x60 兼容老款 LG
+                let altOK = writeVCP(
+                    code: Self.vcpInputSelectLGAlt,
+                    value: source.lgAltCode,
+                    service: target.service,
+                    dataAddress: Self.dataAddressLGAlt
+                )
+                usleep(25_000)
+                let stdOK = writeVCP(
+                    code: Self.vcpInputSelectStandard,
+                    value: source.standardCode,
+                    service: target.service,
+                    dataAddress: Self.dataAddressStandard
+                )
+                return altOK || stdOK
+            } else {
+                // 其他品牌优先标准 MCCS 0x60，失败时自动回退尝试 0x50/0xF4
+                let stdOK = writeVCP(
+                    code: Self.vcpInputSelectStandard,
+                    value: source.standardCode,
+                    service: target.service,
+                    dataAddress: Self.dataAddressStandard
+                )
+                if stdOK { return true }
+                return writeVCP(
+                    code: Self.vcpInputSelectLGAlt,
+                    value: source.lgAltCode,
+                    service: target.service,
+                    dataAddress: Self.dataAddressLGAlt
+                )
+            }
         }
     }
 

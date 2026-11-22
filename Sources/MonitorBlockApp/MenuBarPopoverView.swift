@@ -15,6 +15,7 @@ final class MenuBarPopoverViewModel: ObservableObject {
     @Published var volumeTargetName: String?
     @Published var ddcVolumes: [Int: Double] = [:]
     @Published var ddcMuted: [Int: Bool] = [:]
+    @Published var inputProtocolMode: InputSourceProtocolMode = .auto
 
     @Published var launchAtLoginEnabled: Bool = false
     @Published var autoRestoreOnQuit: Bool = true
@@ -29,6 +30,8 @@ final class MenuBarPopoverViewModel: ObservableObject {
     private let onToggleAutoRestore: () -> Void
     private let onQuit: () -> Void
     private let onStatusChanged: () -> Void
+
+    private static let inputProtocolKey = "MonitorBlock.inputProtocolMode"
 
     private var pendingVolumeWorkItem: DispatchWorkItem?
     private var pendingDDCWorkItems: [Int: DispatchWorkItem] = [:]
@@ -53,6 +56,10 @@ final class MenuBarPopoverViewModel: ObservableObject {
         self.onToggleAutoRestore = onToggleAutoRestore
         self.onQuit = onQuit
         self.onStatusChanged = onStatusChanged
+        if let raw = UserDefaults.standard.string(forKey: Self.inputProtocolKey),
+           let saved = InputSourceProtocolMode(rawValue: raw) {
+            self.inputProtocolMode = saved
+        }
         refresh(readHardwareDDC: false)
     }
 
@@ -228,11 +235,20 @@ final class MenuBarPopoverViewModel: ObservableObject {
         refresh(readHardwareDDC: true)
     }
 
+    func cycleInputProtocolMode() {
+        inputProtocolMode = inputProtocolMode.next
+        UserDefaults.standard.set(inputProtocolMode.rawValue, forKey: Self.inputProtocolKey)
+    }
+
     func switchInputSource(_ source: DisplayInputSource, endpointIndex: Int) {
         errorBanner = nil
-        let ok = audioManager.setDisplayInputSource(source, endpointIndex: endpointIndex)
+        let ok = audioManager.setDisplayInputSource(
+            source,
+            endpointIndex: endpointIndex,
+            protocolMode: inputProtocolMode
+        )
         if !ok {
-            errorBanner = "发送切换输入源指令（\(source.label)）失败，该显示器或转接器可能不支持 DDC/CI 输入切换。"
+            errorBanner = "发送切换输入源指令（\(source.label)）失败，可尝试点击右上角切换「标准 0x60 / LG 0xF4」协议模式。"
         }
     }
 
@@ -502,7 +518,13 @@ struct MenuBarPopoverView: View {
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.secondary)
                 Spacer()
-                tagBadge("LG / DDC", color: .indigo)
+                Button {
+                    viewModel.cycleInputProtocolMode()
+                } label: {
+                    tagBadge(viewModel.inputProtocolMode.label, color: .indigo)
+                }
+                .buttonStyle(.plain)
+                .help("点击切换协议模式：自动（同时适配标准与 LG）/ 仅标准 MCCS 0x60 / 仅 LG 0xF4")
             }
 
             VStack(spacing: 6) {
