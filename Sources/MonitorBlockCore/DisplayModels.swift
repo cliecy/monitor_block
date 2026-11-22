@@ -31,6 +31,9 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
     public let uuid: String
     public let serialNumber: String?
     public let numericSerial: UInt32?
+    public let vendorID: UInt32?
+    public let modelID: UInt32?
+    public let displayPortToken: String?
     public let name: String
     public let systemName: String
     public let customName: String?
@@ -51,6 +54,9 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         uuid: String,
         serialNumber: String? = nil,
         numericSerial: UInt32? = nil,
+        vendorID: UInt32? = nil,
+        modelID: UInt32? = nil,
+        displayPortToken: String? = nil,
         name: String,
         systemName: String? = nil,
         customName: String? = nil,
@@ -70,6 +76,9 @@ public struct DisplayInfo: Equatable, Identifiable, Sendable {
         self.uuid = uuid
         self.serialNumber = serialNumber
         self.numericSerial = numericSerial
+        self.vendorID = vendorID
+        self.modelID = modelID
+        self.displayPortToken = displayPortToken
         self.name = name
         self.systemName = systemName ?? name
         self.customName = customName

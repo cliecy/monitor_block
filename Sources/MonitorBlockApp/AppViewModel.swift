@@ -64,6 +64,7 @@ final class AppViewModel: ObservableObject {
 
     // Audio State
     @Published var audioDevices: [AudioOutputDevice] = []
+    @Published var audioToDDCIndex: [UInt32: Int] = [:]
     @Published var volume: Double = 0.5
     @Published var isMuted: Bool = false
     @Published var volumeMode: VolumeControlMode = .unsupported
@@ -151,15 +152,40 @@ final class AppViewModel: ObservableObject {
             loadRuleForSelectedTarget()
         }
 
+        audioManager.updateKnownDisplays(displays)
+
+        let rawEndpoints = audioManager.listDDCEndpoints()
+        let displayMapping = audioManager.matchAllDDCEndpoints(for: displays, endpoints: rawEndpoints)
+        displayToDDCIndex = displayMapping
+
+        // 按显示器物理从左到右的顺序排列 DDC 音量卡片（与「显示器」「布局」页视觉顺序完全一致）
+        let displayOrderByDDCIndex: [Int: Int] = {
+            var order: [Int: Int] = [:]
+            for (pos, display) in displays.enumerated() {
+                if let epIdx = displayMapping[display.uuid] {
+                    order[epIdx] = pos
+                }
+            }
+            return order
+        }()
+        ddcEndpoints = rawEndpoints.sorted { lhs, rhs in
+            let lPos = displayOrderByDDCIndex[lhs.index] ?? (1000 + lhs.index)
+            let rPos = displayOrderByDDCIndex[rhs.index] ?? (1000 + rhs.index)
+            if lPos != rPos { return lPos < rPos }
+            return lhs.index < rhs.index
+        }
+
         audioDevices = audioManager.listOutputDevices()
+        audioToDDCIndex = audioManager.matchAllAudioToDDCEndpoints(
+            audioDevices: audioDevices,
+            displays: displays,
+            endpoints: rawEndpoints
+        )
         let snapshot = audioManager.currentVolumeSnapshot(readHardwareDDC: readHardwareDDC)
         volume = snapshot.volume
         isMuted = snapshot.isMuted
         volumeMode = snapshot.mode
         volumeTargetName = snapshot.deviceName
-
-        ddcEndpoints = audioManager.listDDCEndpoints()
-        displayToDDCIndex = audioManager.matchAllDDCEndpoints(for: displays, endpoints: ddcEndpoints)
 
         for ep in ddcEndpoints {
             if let vol = ep.currentVolume {
@@ -741,7 +767,7 @@ final class AppViewModel: ObservableObject {
     // MARK: - Formatting Helpers
 
     func displayTitle(for device: AudioOutputDevice) -> String {
-        if let epIdx = audioManager.matchedDDCEndpointIndex(for: device, allDevices: audioDevices),
+        if let epIdx = audioToDDCIndex[device.id],
            let matchedUUID = displayToDDCIndex.first(where: { $0.value == epIdx })?.key,
            let matchedDisplay = displays.first(where: { $0.uuid == matchedUUID }),
            let custom = matchedDisplay.customName, !custom.isEmpty {

@@ -76,12 +76,24 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     public let currentVolume: Int?
     public let isMuted: Bool
 
+    public var displayPortToken: String? {
+        guard let registryPath else { return nil }
+        let lowered = registryPath.lowercased()
+        if let range = lowered.range(of: #"dispext\d+"#, options: .regularExpression) {
+            return String(lowered[range])
+        }
+        return nil
+    }
+
     public var storageKey: String {
         if let serialNumber, !serialNumber.isEmpty {
             return "serial:\(serialNumber)"
         }
         if let numericSerial, numericSerial != 0 {
             return "numserial:\(numericSerial)"
+        }
+        if let token = displayPortToken {
+            return "port:\(token)"
         }
         if let registryPath, !registryPath.isEmpty {
             return "path:\(registryPath)"

@@ -377,4 +377,99 @@ struct AudioManagerTests {
         #expect(reboundMapping["u-center"] == 0)
         #expect(reboundMapping["u-right"] == 1)
     }
+
+    @Test("真实双 LG UltraFine 硬件拓扑回归测试：dispext0/1 管线与 CoreAudio EDID UID 100% 一对一精准对齐")
+    func realDualLGUltraFineHardwareTopologyAlignment() {
+        let store = InMemoryStateStore()
+
+        // 模拟本机真实捕获数据：
+        // id=2（右屏，主屏）-> vendor=7789(0x1E6D), model=23709(0x5C9D -> 小端 9D5C), dispext1
+        // id=3（中屏，左侧）-> vendor=7789(0x1E6D), model=23741(0x5CBD -> 小端 BD5C), dispext0
+        let rightDisplay = DisplayInfo(
+            id: 2,
+            uuid: "uuid-right",
+            serialNumber: "651685",
+            numericSerial: 651685,
+            vendorID: 7789,
+            modelID: 23709,
+            displayPortToken: "dispext1",
+            name: "右屏",
+            systemName: "LG ULTRAFINE",
+            customName: "右屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: 0,
+            width: 1920,
+            height: 1080,
+            isMain: true
+        )
+        let centerDisplay = DisplayInfo(
+            id: 3,
+            uuid: "uuid-center",
+            serialNumber: "508957",
+            numericSerial: 508957,
+            vendorID: 7789,
+            modelID: 23741,
+            displayPortToken: "dispext0",
+            name: "中屏",
+            systemName: "LG ULTRAFINE",
+            customName: "中屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: -1920,
+            width: 1920,
+            height: 1080,
+            isMain: false
+        )
+
+        // IOKit DCPAVServiceProxy 无 ProductAttributes，仅有 dispext0 / dispext1 路径！
+        let ddc = MockDDCBackend()
+        ddc.endpoints = [
+            DDCDisplayEndpoint(
+                index: 0,
+                name: "外接显示器 #1",
+                registryPath: "IOService:/.../dispext0:dcpav-service-epic:0/DCPAVServiceProxy"
+            ),
+            DDCDisplayEndpoint(
+                index: 1,
+                name: "外接显示器 #2",
+                registryPath: "IOService:/.../dispext1:dcpav-service-epic:0/DCPAVServiceProxy"
+            )
+        ]
+        ddc.hardwareVolumes = [0: 40, 1: 37]
+
+        // CoreAudio 真实设备：
+        // id=101 -> 1E6D9D5C-... (HDMI -> model 23709 -> 右屏 -> dispext1 -> DDC[1])
+        // id=86  -> 1E6DBD5C-... (DP   -> model 23741 -> 中屏 -> dispext0 -> DDC[0])
+        let audio = MockAudioBackend()
+        audio.devices = [
+            AudioOutputDevice(id: 101, uid: "1E6D9D5C-0000-0000-0A23-010380462878", name: "LG ULTRAFINE", transport: .hdmi, isDefault: false, supportsCoreAudioVolume: false),
+            AudioOutputDevice(id: 86, uid: "1E6DBD5C-0000-0000-0A24-0104B53C2278", name: "LG ULTRAFINE", transport: .displayPort, isDefault: true, supportsCoreAudioVolume: false)
+        ]
+
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, store: store)
+        manager.updateKnownDisplays([centerDisplay, rightDisplay])
+
+        // 1. Display -> DDC：中屏(dispext0) 必须对应 DDC[0]，右屏(dispext1) 必须对应 DDC[1]
+        let displayMap = manager.matchAllDDCEndpoints(for: [centerDisplay, rightDisplay], endpoints: ddc.endpoints)
+        #expect(displayMap["uuid-center"] == 0)
+        #expect(displayMap["uuid-right"] == 1)
+
+        // 2. Audio -> DDC：Audio 86 (BD5C=中屏) 必须对应 DDC[0]，Audio 101 (9D5C=右屏) 必须对应 DDC[1]，绝不撞车！
+        let audioMap = manager.matchAllAudioToDDCEndpoints(audioDevices: audio.devices, displays: [centerDisplay, rightDisplay], endpoints: ddc.endpoints)
+        #expect(audioMap[86] == 0)
+        #expect(audioMap[101] == 1)
+
+        // 3. 当前默认输出是 Audio 86（中屏）-> 主音量必须是 DDC[0] (40%)；切到 Audio 101（右屏）-> 主音量必须是 DDC[1] (37%)
+        let snapCenter = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(snapCenter.mode == .ddc(ddcIndex: 0, displayName: "外接显示器 #1"))
+        #expect(abs(snapCenter.volume - 0.40) < 0.001)
+
+        #expect(manager.selectOutputDevice(id: 101) == true)
+        let snapRight = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(snapRight.mode == .ddc(ddcIndex: 1, displayName: "外接显示器 #2"))
+        #expect(abs(snapRight.volume - 0.37) < 0.001)
+    }
 }
