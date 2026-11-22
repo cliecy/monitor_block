@@ -92,6 +92,48 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     }
 }
 
+public enum DisplayInputSource: String, CaseIterable, Identifiable, Equatable, Sendable {
+    case hdmi1
+    case hdmi2
+    case displayPort1
+    case displayPort2
+    case usbC
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .hdmi1: return "HDMI 1"
+        case .hdmi2: return "HDMI 2"
+        case .displayPort1: return "DP 1"
+        case .displayPort2: return "DP 2"
+        case .usbC: return "USB-C"
+        }
+    }
+
+    /// 标准 MCCS VCP 0x60 输入源编码
+    public var standardCode: UInt16 {
+        switch self {
+        case .displayPort1: return 0x0F // 15
+        case .displayPort2: return 0x10 // 16
+        case .hdmi1: return 0x11        // 17
+        case .hdmi2: return 0x12        // 18
+        case .usbC: return 0x1B         // 27
+        }
+    }
+
+    /// LG 专有 VCP 0xF4 (dataAddress 0x50) 输入源编码
+    public var lgAltCode: UInt16 {
+        switch self {
+        case .displayPort1: return 0xD0 // 208
+        case .displayPort2: return 0xD1 // 209
+        case .usbC: return 0xD2         // 210
+        case .hdmi1: return 0x90        // 144
+        case .hdmi2: return 0x91        // 145
+        }
+    }
+}
+
 public struct AudioVolumeSnapshot: Equatable, Sendable {
     public let deviceID: UInt32?
     public let deviceName: String?

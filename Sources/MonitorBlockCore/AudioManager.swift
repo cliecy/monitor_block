@@ -572,6 +572,11 @@ public final class AudioManager {
         }
     }
 
+    @discardableResult
+    public func setDisplayInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
+        ddcBackend.setInputSource(source, endpointIndex: endpointIndex)
+    }
+
     public func startObservingChanges(_ handler: @escaping @Sendable () -> Void) {
         audioBackend.startObservingChanges(handler)
     }

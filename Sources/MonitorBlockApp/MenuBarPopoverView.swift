@@ -228,6 +228,14 @@ final class MenuBarPopoverViewModel: ObservableObject {
         refresh(readHardwareDDC: true)
     }
 
+    func switchInputSource(_ source: DisplayInputSource, endpointIndex: Int) {
+        errorBanner = nil
+        let ok = audioManager.setDisplayInputSource(source, endpointIndex: endpointIndex)
+        if !ok {
+            errorBanner = "发送切换输入源指令（\(source.label)）失败，该显示器或转接器可能不支持 DDC/CI 输入切换。"
+        }
+    }
+
     var activeDDCEndpointIndex: Int? {
         if case .ddc(let idx, _) = volumeMode {
             return idx
@@ -330,11 +338,14 @@ struct MenuBarPopoverView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 10) {
                     displaysCard
+                    if !viewModel.ddcEndpoints.isEmpty {
+                        inputSourceCard
+                    }
                     audioCard
                     presetsCard
                 }
             }
-            .frame(maxHeight: 480)
+            .frame(maxHeight: 520)
 
             footerBar
         }
@@ -480,6 +491,48 @@ struct MenuBarPopoverView: View {
         .padding(.vertical, 6)
         .background(Color.primary.opacity(0.035))
         .cornerRadius(8)
+    }
+
+    // MARK: - Input Source Card
+
+    private var inputSourceCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("信号输入源", systemImage: "cable.connector.horizontal")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                Spacer()
+                tagBadge("LG / DDC", color: .indigo)
+            }
+
+            VStack(spacing: 6) {
+                ForEach(viewModel.ddcEndpoints) { ep in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(viewModel.displayTitle(for: ep))
+                            .font(.system(size: 11.5, weight: .medium))
+                            .lineLimit(1)
+
+                        HStack(spacing: 4) {
+                            ForEach(DisplayInputSource.allCases) { source in
+                                Button(source.label) {
+                                    viewModel.switchInputSource(source, endpointIndex: ep.index)
+                                }
+                                .font(.system(size: 10.5, weight: .medium))
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.035))
+                    .cornerRadius(8)
+                }
+            }
+        }
+        .padding(10)
+        .background(cardBackground)
     }
 
     // MARK: - Audio Card

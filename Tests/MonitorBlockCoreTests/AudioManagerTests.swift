@@ -60,6 +60,7 @@ private final class MockDDCBackend: DDCBackend {
     var hardwareVolumes: [Int: Int] = [:]
     var setVolumeCalls: [(index: Int, volume: Int)] = []
     var setMuteCalls: [(index: Int, muted: Bool)] = []
+    var setInputCalls: [(index: Int, source: DisplayInputSource)] = []
     var muteSupported: Bool = true
 
     func listEndpoints() -> [DDCDisplayEndpoint] {
@@ -79,6 +80,11 @@ private final class MockDDCBackend: DDCBackend {
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
         setMuteCalls.append((endpointIndex, muted))
         return muteSupported
+    }
+
+    func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
+        setInputCalls.append((endpointIndex, source))
+        return true
     }
 }
 
@@ -225,5 +231,33 @@ struct AudioManagerTests {
         let restarted = AudioManager(audioBackend: audio, ddcBackend: ddc, store: store)
         let afterRestart = restarted.currentVolumeSnapshot(readHardwareDDC: true)
         #expect(afterRestart.mode == .ddc(ddcIndex: 0, displayName: "LG HDR 4K"))
+    }
+
+    @Test("切换外接显示器视频输入源（HDMI1/HDMI2/DP1/DP2/USB-C）与 LG 编码映射")
+    func switchDisplayInputSource() {
+        let ddc = MockDDCBackend()
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "LG HDR 4K"),
+            DDCDisplayEndpoint(index: 1, name: "LG HDR 4K")
+        ]
+        let manager = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, store: InMemoryStateStore())
+
+        #expect(manager.setDisplayInputSource(.hdmi1, endpointIndex: 0) == true)
+        #expect(manager.setDisplayInputSource(.usbC, endpointIndex: 1) == true)
+
+        #expect(ddc.setInputCalls.count == 2)
+        #expect(ddc.setInputCalls[0].index == 0)
+        #expect(ddc.setInputCalls[0].source == .hdmi1)
+        #expect(ddc.setInputCalls[1].index == 1)
+        #expect(ddc.setInputCalls[1].source == .usbC)
+
+        // 校验 LG 专有 VCP 0xF4 编码与标准 MCCS 0x60 编码
+        #expect(DisplayInputSource.hdmi1.lgAltCode == 0x90)
+        #expect(DisplayInputSource.hdmi2.lgAltCode == 0x91)
+        #expect(DisplayInputSource.displayPort1.lgAltCode == 0xD0)
+        #expect(DisplayInputSource.displayPort2.lgAltCode == 0xD1)
+        #expect(DisplayInputSource.usbC.lgAltCode == 0xD2)
+        #expect(DisplayInputSource.hdmi1.standardCode == 0x11)
+        #expect(DisplayInputSource.displayPort1.standardCode == 0x0F)
     }
 }

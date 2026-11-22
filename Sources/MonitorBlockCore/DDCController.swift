@@ -8,6 +8,7 @@ public protocol DDCBackend: AnyObject {
     func readVolume(endpointIndex: Int) -> Int?
     func setVolume(_ volume: Int, endpointIndex: Int) -> Bool
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool
+    func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool
 }
 
 private typealias IOAVServiceCreateWithServiceFunc = @convention(c) (
@@ -34,7 +35,10 @@ private typealias IOAVServiceReadI2CFunc = @convention(c) (
 /// Apple Silicon DDC/CI 控制器（基于 IOKit DCPAVServiceProxy + IOAVService I2C）
 public final class AppleSiliconDDCBackend: DDCBackend {
     private static let chipAddress: UInt32 = 0x37
-    private static let dataAddress: UInt32 = 0x51
+    private static let dataAddressStandard: UInt32 = 0x51
+    private static let dataAddressLGAlt: UInt32 = 0x50
+    private static let vcpInputSelectStandard: UInt8 = 0x60
+    private static let vcpInputSelectLGAlt: UInt8 = 0xF4
     private static let vcpAudioVolume: UInt8 = 0x62
     private static let vcpAudioMute: UInt8 = 0x8D
 
@@ -105,7 +109,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
 
         let writeStatus = request.withUnsafeMutableBytes { buf -> IOReturn in
             guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
-            return writeI2C(service, Self.chipAddress, Self.dataAddress, ptr, UInt32(buf.count))
+            return writeI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
         }
         guard writeStatus == kIOReturnSuccess else { return nil }
 
@@ -114,7 +118,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         var reply = [UInt8](repeating: 0, count: 12)
         let readStatus = reply.withUnsafeMutableBytes { buf -> IOReturn in
             guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
-            return readI2C(service, Self.chipAddress, Self.dataAddress, ptr, UInt32(buf.count))
+            return readI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
         }
         guard readStatus == kIOReturnSuccess else { return nil }
         guard reply[2] == 0x02, reply[3] == 0x00, reply[4] == vcp else { return nil }
@@ -127,31 +131,94 @@ public final class AppleSiliconDDCBackend: DDCBackend {
 
     public func setVolume(_ volume: Int, endpointIndex: Int) -> Bool {
         let clamped = UInt16(min(max(volume, 0), 100))
-        return writeVCP(code: Self.vcpAudioVolume, value: clamped, endpointIndex: endpointIndex)
+        return writeVCP(
+            code: Self.vcpAudioVolume,
+            value: clamped,
+            endpointIndex: endpointIndex,
+            dataAddress: Self.dataAddressStandard
+        )
     }
 
     public func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
         // MCCS VCP 0x8D: 1 = Mute, 2 = Unmute
         let value: UInt16 = muted ? 1 : 2
-        return writeVCP(code: Self.vcpAudioMute, value: value, endpointIndex: endpointIndex)
+        return writeVCP(
+            code: Self.vcpAudioMute,
+            value: value,
+            endpointIndex: endpointIndex,
+            dataAddress: Self.dataAddressStandard
+        )
     }
 
-    private func writeVCP(code: UInt8, value: UInt16, endpointIndex: Int) -> Bool {
-        guard let writeI2C else { return false }
+    public func setInputSource(_ source: DisplayInputSource, endpointIndex: Int) -> Bool {
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return false }
-        let service = services[endpointIndex].service
+        let target = services[endpointIndex]
+        let isLG = target.name.lowercased().contains("lg")
+
+        if isLG {
+            // 新款 LG 优先走专有 I2C 0x50 + VCP 0xF4，并补发标准 0x51 + VCP 0x60 兼容老款 LG
+            let altOK = writeVCP(
+                code: Self.vcpInputSelectLGAlt,
+                value: source.lgAltCode,
+                service: target.service,
+                dataAddress: Self.dataAddressLGAlt
+            )
+            usleep(25_000)
+            let stdOK = writeVCP(
+                code: Self.vcpInputSelectStandard,
+                value: source.standardCode,
+                service: target.service,
+                dataAddress: Self.dataAddressStandard
+            )
+            return altOK || stdOK
+        } else {
+            let stdOK = writeVCP(
+                code: Self.vcpInputSelectStandard,
+                value: source.standardCode,
+                service: target.service,
+                dataAddress: Self.dataAddressStandard
+            )
+            if stdOK { return true }
+            return writeVCP(
+                code: Self.vcpInputSelectLGAlt,
+                value: source.lgAltCode,
+                service: target.service,
+                dataAddress: Self.dataAddressLGAlt
+            )
+        }
+    }
+
+    private func writeVCP(
+        code: UInt8,
+        value: UInt16,
+        endpointIndex: Int,
+        dataAddress: UInt32
+    ) -> Bool {
+        let services = discoverExternalAVServices()
+        guard services.indices.contains(endpointIndex) else { return false }
+        return writeVCP(code: code, value: value, service: services[endpointIndex].service, dataAddress: dataAddress)
+    }
+
+    private func writeVCP(
+        code: UInt8,
+        value: UInt16,
+        service: CFTypeRef,
+        dataAddress: UInt32
+    ) -> Bool {
+        guard let writeI2C else { return false }
 
         let highByte = UInt8((value >> 8) & 0xFF)
         let lowByte = UInt8(value & 0xFF)
-        let checksum: UInt8 = 0x6E ^ 0x51 ^ 0x84 ^ 0x03 ^ code ^ highByte ^ lowByte
+        let addrByte = UInt8(dataAddress & 0xFF)
+        let checksum: UInt8 = 0x6E ^ addrByte ^ 0x84 ^ 0x03 ^ code ^ highByte ^ lowByte
         var packet: [UInt8] = [0x84, 0x03, code, highByte, lowByte, checksum]
 
         var succeeded = false
         for attempt in 0..<2 {
             let status = packet.withUnsafeMutableBytes { buf -> IOReturn in
                 guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
-                return writeI2C(service, Self.chipAddress, Self.dataAddress, ptr, UInt32(buf.count))
+                return writeI2C(service, Self.chipAddress, dataAddress, ptr, UInt32(buf.count))
             }
             if status == kIOReturnSuccess {
                 succeeded = true
