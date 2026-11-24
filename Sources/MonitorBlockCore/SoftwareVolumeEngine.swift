@@ -422,8 +422,11 @@ public final class CoreAudioProcessTapVolumeEngine: SoftwareVolumeBackend {
         desc.name = "MonitorBlock Software Volume Tap"
         desc.isPrivate = true
         desc.muteBehavior = .mutedWhenTapped
-        if #available(macOS 26.0, *), let bundleID = Bundle.main.bundleIdentifier, !bundleID.isEmpty {
-            desc.bundleIDs = [bundleID]
+        // macOS 26+ 才在 SDK 中新增 bundleIDs 属性；通过运行时 KVC 安全设置以兼容 macOS 15 SDK (GitHub Actions)
+        if let bundleID = Bundle.main.bundleIdentifier,
+           !bundleID.isEmpty,
+           desc.responds(to: NSSelectorFromString("setBundleIDs:")) {
+            desc.setValue([bundleID], forKey: "bundleIDs")
         }
     }
 
