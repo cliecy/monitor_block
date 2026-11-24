@@ -108,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         displayManager.stopObservingReconfiguration()
         audioManager.stopObservingChanges()
+        audioManager.stopSoftwareVolume()
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
@@ -143,6 +144,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let isMainWindowVisible = self.mainWindowController?.window?.isVisible ?? false
             if self.popover.isShown || isMainWindowVisible {
                 self.appViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+            } else {
+                // 即使面板未打开，系统默认输出设备切换时也需立刻释放不再适用的软件音量代理
+                _ = self.audioManager.currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)
             }
         }
         pendingRefreshWorkItem = workItem

@@ -5,6 +5,9 @@ import IOKit
 public protocol DDCBackend: AnyObject {
     var isAvailable: Bool { get }
     func listEndpoints() -> [DDCDisplayEndpoint]
+    func probeCapabilities(endpointIndex: Int) -> DDCCapabilities
+    func readBrightness(endpointIndex: Int) -> Int?
+    func setBrightness(_ brightness: Int, endpointIndex: Int) -> Bool
     func readVolume(endpointIndex: Int) -> Int?
     func setVolume(_ volume: Int, endpointIndex: Int) -> Bool
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool
@@ -43,6 +46,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     private static let chipAddress: UInt32 = 0x37
     private static let dataAddressStandard: UInt32 = 0x51
     private static let dataAddressLGAlt: UInt32 = 0x50
+    private static let vcpBrightness: UInt8 = 0x10
     private static let vcpInputSelectStandard: UInt8 = 0x60
     private static let vcpInputSelectLGAlt: UInt8 = 0xF4
     private static let vcpAudioVolume: UInt8 = 0x62
@@ -103,16 +107,64 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         }
     }
 
-    public func readVolume(endpointIndex: Int) -> Int? {
-        guard let writeI2C, let readI2C else { return nil }
+    public func probeCapabilities(endpointIndex: Int) -> DDCCapabilities {
         let services = discoverExternalAVServices()
-        guard services.indices.contains(endpointIndex) else { return nil }
+        guard services.indices.contains(endpointIndex) else {
+            return .unreachable
+        }
         let service = services[endpointIndex].service
 
-        // Get VCP Feature: [0x82, 0x01, vcp, checksum]
-        let vcp = Self.vcpAudioVolume
-        let checksum: UInt8 = 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ vcp
-        var request: [UInt8] = [0x82, 0x01, vcp, checksum]
+        // 第 1 步：快速测试 I2C 是否可达（读亮度 0x10，失败再读音量 0x62），避免对 EIZO 等无 I2C 屏空等 24 次超时
+        let brightnessProbe = readVCPPercentage(code: Self.vcpBrightness, service: service)
+        let volumeProbe = (brightnessProbe == nil) ? readVCPPercentage(code: Self.vcpAudioVolume, service: service) : nil
+        guard brightnessProbe != nil || volumeProbe != nil else {
+            return .unreachable
+        }
+
+        // 第 2 步：读取完整 MCCS Capabilities (0xF3) 字符串
+        if let rawCap = readCapabilitiesString(service: service),
+           let parsed = DDCCapabilities.parse(capabilitiesString: rawCap) {
+            return parsed
+        }
+
+        // 第 3 步：部分显示器（如部分 LG 机型）不完整返回 0xF3，按实际读值能力回退
+        let volReachable = (volumeProbe != nil) || (readVCPPercentage(code: Self.vcpAudioVolume, service: service) != nil)
+        return DDCCapabilities(
+            isReachable: true,
+            supportsBrightness: brightnessProbe != nil,
+            supportsVolume: volReachable,
+            supportedInputs: nil,
+            rawCapabilitiesString: nil
+        )
+    }
+
+    public func readBrightness(endpointIndex: Int) -> Int? {
+        let services = discoverExternalAVServices()
+        guard services.indices.contains(endpointIndex) else { return nil }
+        return readVCPPercentage(code: Self.vcpBrightness, service: services[endpointIndex].service)
+    }
+
+    public func setBrightness(_ brightness: Int, endpointIndex: Int) -> Bool {
+        let clamped = UInt16(min(max(brightness, 0), 100))
+        return writeVCP(
+            code: Self.vcpBrightness,
+            value: clamped,
+            endpointIndex: endpointIndex,
+            dataAddress: Self.dataAddressStandard
+        )
+    }
+
+    public func readVolume(endpointIndex: Int) -> Int? {
+        let services = discoverExternalAVServices()
+        guard services.indices.contains(endpointIndex) else { return nil }
+        return readVCPPercentage(code: Self.vcpAudioVolume, service: services[endpointIndex].service)
+    }
+
+    private func readVCPPercentage(code: UInt8, service: CFTypeRef) -> Int? {
+        guard let writeI2C, let readI2C else { return nil }
+
+        let checksum: UInt8 = 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ code
+        var request: [UInt8] = [0x82, 0x01, code, checksum]
 
         let writeStatus = request.withUnsafeMutableBytes { buf -> IOReturn in
             guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
@@ -128,12 +180,50 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             return readI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
         }
         guard readStatus == kIOReturnSuccess else { return nil }
-        guard reply[2] == 0x02, reply[3] == 0x00, reply[4] == vcp else { return nil }
+        guard reply[2] == 0x02, reply[3] == 0x00, reply[4] == code else { return nil }
 
         let maxValue = (Int(reply[6]) << 8) | Int(reply[7])
         let currentValue = (Int(reply[8]) << 8) | Int(reply[9])
         guard maxValue > 0 else { return min(max(currentValue, 0), 100) }
         return min(max(Int((Double(currentValue) / Double(maxValue) * 100.0).rounded()), 0), 100)
+    }
+
+    private func readCapabilitiesString(service: CFTypeRef) -> String? {
+        guard let writeI2C, let readI2C else { return nil }
+        var full = Data()
+        var offset: UInt16 = 0
+
+        for _ in 0..<24 {
+            let hi = UInt8((offset >> 8) & 0xFF)
+            let lo = UInt8(offset & 0xFF)
+            let checksum: UInt8 = 0x6E ^ 0x51 ^ 0x83 ^ 0xF3 ^ hi ^ lo
+            var request: [UInt8] = [0x83, 0xF3, hi, lo, checksum]
+
+            let wkr = request.withUnsafeMutableBytes { buf -> IOReturn in
+                guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
+                return writeI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
+            }
+            guard wkr == kIOReturnSuccess else { break }
+
+            usleep(55_000)
+
+            var reply = [UInt8](repeating: 0, count: 38)
+            let rkr = reply.withUnsafeMutableBytes { buf -> IOReturn in
+                guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
+                return readI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
+            }
+            guard rkr == kIOReturnSuccess, reply[2] == 0xE3 else { break }
+
+            let lenByte = Int(reply[1] & 0x7F)
+            let chunkLen = max(0, min(lenByte - 3, 32))
+            if chunkLen == 0 { break }
+
+            full.append(contentsOf: reply[5..<(5 + chunkLen)])
+            offset += UInt16(chunkLen)
+        }
+
+        guard !full.isEmpty else { return nil }
+        return String(data: full, encoding: .ascii)
     }
 
     public func setVolume(_ volume: Int, endpointIndex: Int) -> Bool {

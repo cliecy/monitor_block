@@ -84,6 +84,32 @@ func volumeSymbolName(level: Double, muted: Bool) -> String {
     }
 }
 
+struct SoftwareVolumeErrorRow: View {
+    let message: String
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: "lock.shield")
+                .font(.system(size: 12))
+                .foregroundColor(.orange)
+            Text(message)
+                .font(.system(size: 10.5))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+            Button("打开隐私设置", action: onOpenSettings)
+                .font(.system(size: 10.5, weight: .medium))
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color.orange.opacity(0.10))
+        .cornerRadius(7)
+    }
+}
+
 // MARK: - Display Role Segmented Control (Main / Extended / Mirrored)
 
 struct DisplayModeSegmentedControl: View {
@@ -218,16 +244,18 @@ struct InputSourceControlStrip: View {
     let displayUUID: String
     let endpointIndex: Int
     let displayName: String
+    let supportedSources: [DisplayInputSource]
     @ObservedObject var viewModel: AppViewModel
 
     var body: some View {
         let status = viewModel.inputStatuses[endpointIndex]
         let activeSource = status?.activeSource
         let switchingTarget = viewModel.switchingInputs[endpointIndex]
+        let visibleSources = supportedSources.isEmpty ? DisplayInputSource.allCases : supportedSources
 
         HStack(spacing: 5) {
             HStack(spacing: 3) {
-                ForEach(DisplayInputSource.allCases) { source in
+                ForEach(visibleSources) { source in
                     let isSelected = (switchingTarget == source) || (switchingTarget == nil && activeSource == source)
                     let isSwitchingThis = (switchingTarget == source)
                     let isCalibrated = (status?.calibratedCodes[source] != nil)
@@ -350,6 +378,7 @@ struct DisplayControlCard: View {
 
     var body: some View {
         let ddcIndex = viewModel.displayToDDCIndex[display.uuid]
+        let caps = ddcIndex.flatMap { viewModel.ddcCapabilities[$0] }
         let isEnabled = display.isEnabledForDisplay
 
         SurfaceCard {
@@ -376,6 +405,9 @@ struct DisplayControlCard: View {
                             }
                             if viewModel.hasDisableRule(for: display.uuid) {
                                 PillTag(text: "规则", color: .indigo)
+                            }
+                            if !display.isBuiltin, ddcIndex != nil, caps?.isReachable == false {
+                                PillTag(text: "无 DDC/CI", color: .secondary)
                             }
                         }
 
@@ -428,18 +460,42 @@ struct DisplayControlCard: View {
                     // Role Switcher: Main / Extended / Mirror
                     DisplayModeSegmentedControl(display: display, viewModel: viewModel)
 
-                    // Input Source Strip (for DDC-capable external monitors)
-                    if let idx = ddcIndex {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text("信号输入源")
-                                .font(.system(size: 10.5, weight: .medium))
-                                .foregroundColor(.secondary)
-                            InputSourceControlStrip(
-                                displayUUID: display.uuid,
-                                endpointIndex: idx,
-                                displayName: display.name,
-                                viewModel: viewModel
-                            )
+                    // External Hardware Brightness (VCP 0x10) & Input Source Strip (for reachable DDC monitors)
+                    if let idx = ddcIndex, caps?.isReachable != false {
+                        if caps == nil || caps?.supportsBrightness == true {
+                            let bright = viewModel.ddcBrightness[idx] ?? 0.5
+                            HStack(spacing: 8) {
+                                Image(systemName: "sun.max.fill")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.orange)
+                                    .frame(width: 16)
+                                Slider(
+                                    value: Binding(
+                                        get: { bright },
+                                        set: { viewModel.updateDDCBrightness(endpointIndex: idx, value: $0) }
+                                    ),
+                                    in: 0...1
+                                )
+                                Text("\(Int((bright * 100).rounded()))%")
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 34, alignment: .trailing)
+                            }
+                        }
+
+                        if caps?.supportedInputs != [] {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("信号输入源")
+                                    .font(.system(size: 10.5, weight: .medium))
+                                    .foregroundColor(.secondary)
+                                InputSourceControlStrip(
+                                    displayUUID: display.uuid,
+                                    endpointIndex: idx,
+                                    displayName: display.name,
+                                    supportedSources: caps?.supportedInputs ?? DisplayInputSource.allCases,
+                                    viewModel: viewModel
+                                )
+                            }
                         }
                     }
 

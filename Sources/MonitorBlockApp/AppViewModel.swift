@@ -58,6 +58,8 @@ final class AppViewModel: ObservableObject {
     // DDC & Input Source State
     @Published var ddcEndpoints: [DDCDisplayEndpoint] = []
     @Published var displayToDDCIndex: [String: Int] = [:]
+    @Published var ddcCapabilities: [Int: DDCCapabilities] = [:]
+    @Published var ddcBrightness: [Int: Double] = [:]
     @Published var inputStatuses: [Int: DisplayInputStatus] = [:]
     @Published var switchingInputs: [Int: DisplayInputSource] = [:]
     @Published var inputProtocolMode: InputSourceProtocolMode = .auto
@@ -71,6 +73,8 @@ final class AppViewModel: ObservableObject {
     @Published var volumeTargetName: String?
     @Published var ddcVolumes: [Int: Double] = [:]
     @Published var ddcMuted: [Int: Bool] = [:]
+    @Published var isSoftwareVolumeEnabled: Bool = true
+    @Published var softwareVolumeError: String?
 
     // Preferences & Banner
     @Published var launchAtLoginEnabled: Bool = false
@@ -92,9 +96,11 @@ final class AppViewModel: ObservableObject {
     private let onStatusChanged: () -> Void
 
     private static let inputProtocolKey = "MonitorBlock.inputProtocolMode"
+    private static let softwareVolumeKey = "MonitorBlock.softwareVolumeEnabled"
 
     private var pendingVolumeWorkItem: DispatchWorkItem?
     private var pendingDDCWorkItems: [Int: DispatchWorkItem] = [:]
+    private var pendingBrightnessWorkItems: [Int: DispatchWorkItem] = [:]
     private var bannerClearWorkItem: DispatchWorkItem?
 
     init(
@@ -122,6 +128,15 @@ final class AppViewModel: ObservableObject {
            let saved = InputSourceProtocolMode(rawValue: raw) {
             self.inputProtocolMode = saved
         }
+        let softVolEnabled: Bool
+        if UserDefaults.standard.object(forKey: Self.softwareVolumeKey) == nil {
+            softVolEnabled = true
+        } else {
+            softVolEnabled = UserDefaults.standard.bool(forKey: Self.softwareVolumeKey)
+        }
+        self.isSoftwareVolumeEnabled = softVolEnabled
+        self.audioManager.isSoftwareVolumeEnabled = softVolEnabled
+
         refresh(readHardwareDDC: false)
     }
 
@@ -181,13 +196,22 @@ final class AppViewModel: ObservableObject {
             displays: displays,
             endpoints: rawEndpoints
         )
-        let snapshot = audioManager.currentVolumeSnapshot(readHardwareDDC: readHardwareDDC)
+        let snapshot = audioManager.currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)
         volume = snapshot.volume
         isMuted = snapshot.isMuted
         volumeMode = snapshot.mode
         volumeTargetName = snapshot.deviceName
+        softwareVolumeError = audioManager.softwareVolumeLastError
 
         for ep in ddcEndpoints {
+            if let caps = ep.capabilities {
+                ddcCapabilities[ep.index] = caps
+            }
+            if let bright = ep.currentBrightness {
+                ddcBrightness[ep.index] = Double(bright) / 100.0
+            } else if ddcBrightness[ep.index] == nil {
+                ddcBrightness[ep.index] = 0.5
+            }
             if let vol = ep.currentVolume {
                 ddcVolumes[ep.index] = Double(vol) / 100.0
             } else if ddcVolumes[ep.index] == nil {
@@ -200,28 +224,58 @@ final class AppViewModel: ObservableObject {
         }
 
         if readHardwareDDC {
-            refreshAllInputStatusesAsync()
+            probeDDCStateAsync()
         }
     }
 
-    func refreshAllInputStatusesAsync() {
+    func probeDDCStateAsync(forceCapabilities: Bool = false) {
         let indices = ddcEndpoints.map(\.index)
         guard !indices.isEmpty else { return }
         let audioMgr = audioManager
 
         Task.detached(priority: .userInitiated) {
-            var results: [Int: DisplayInputStatus] = [:]
+            var capsMap: [Int: DDCCapabilities] = [:]
+            var inputMap: [Int: DisplayInputStatus] = [:]
             for idx in indices {
-                results[idx] = audioMgr.readDisplayInputStatus(endpointIndex: idx)
-            }
-            let finalResults = results
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                for (idx, status) in finalResults {
-                    self.inputStatuses[idx] = status
+                let caps = audioMgr.probeCapabilitiesAndBrightness(endpointIndex: idx, force: forceCapabilities)
+                capsMap[idx] = caps
+                if caps.isReachable {
+                    inputMap[idx] = audioMgr.readDisplayInputStatus(endpointIndex: idx)
                 }
             }
+            let updatedEndpoints = audioMgr.listDDCEndpoints()
+            let updatedSnapshot = audioMgr.currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)
+            let lastErr = audioMgr.softwareVolumeLastError
+
+            let finalCaps = capsMap
+            let finalInputs = inputMap
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                for (idx, caps) in finalCaps {
+                    self.ddcCapabilities[idx] = caps
+                }
+                for ep in updatedEndpoints {
+                    if let bright = ep.currentBrightness {
+                        self.ddcBrightness[ep.index] = Double(bright) / 100.0
+                    }
+                    if let vol = ep.currentVolume {
+                        self.ddcVolumes[ep.index] = Double(vol) / 100.0
+                    }
+                }
+                for (idx, status) in finalInputs {
+                    self.inputStatuses[idx] = status
+                }
+                self.volume = updatedSnapshot.volume
+                self.isMuted = updatedSnapshot.isMuted
+                self.volumeMode = updatedSnapshot.mode
+                self.volumeTargetName = updatedSnapshot.deviceName
+                self.softwareVolumeError = lastErr
+            }
         }
+    }
+
+    func refreshAllInputStatusesAsync() {
+        probeDDCStateAsync(forceCapabilities: false)
     }
 
     func refreshSingleInputStatusAsync(endpointIndex: Int) {
@@ -253,6 +307,20 @@ final class AppViewModel: ObservableObject {
             return idx
         }
         return nil
+    }
+
+    var isSoftwareVolumeSupported: Bool {
+        audioManager.isSoftwareVolumeSupported
+    }
+
+    /// 仅返回支持 DDC/CI 硬件音量（或尚未完成能力探测）的外接显示器，隐藏 EIZO / Dell U2718Q 等无效滑块
+    var ddcVolumeEndpoints: [DDCDisplayEndpoint] {
+        ddcEndpoints.filter { ep in
+            guard let caps = ddcCapabilities[ep.index] ?? ep.capabilities else {
+                return true
+            }
+            return caps.isReachable && caps.supportsVolume
+        }
     }
 
     func hasDisableRule(for uuid: String) -> Bool {
@@ -646,10 +714,27 @@ final class AppViewModel: ObservableObject {
         showBanner("已重置「\(displayName)」的输入源校准", isError: false)
     }
 
+    func updateDDCBrightness(endpointIndex: Int, value: Double) {
+        let clamped = min(max(value, 0.0), 1.0)
+        ddcBrightness[endpointIndex] = clamped
+
+        pendingBrightnessWorkItems[endpointIndex]?.cancel()
+        let audioMgr = audioManager
+        let work = DispatchWorkItem {
+            let percent = Int((clamped * 100.0).rounded())
+            Task.detached(priority: .userInitiated) {
+                _ = audioMgr.setDDCBrightness(percent, endpointIndex: endpointIndex)
+            }
+        }
+        pendingBrightnessWorkItems[endpointIndex] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07, execute: work)
+    }
+
     // MARK: - Audio Actions
 
     func selectAudioOutput(_ device: AudioOutputDevice) {
         clearBanner()
+        softwareVolumeError = nil
         if audioManager.selectOutputDevice(id: device.id) {
             refresh(readHardwareDDC: true)
         } else {
@@ -681,6 +766,31 @@ final class AppViewModel: ObservableObject {
             }
             pendingVolumeWorkItem = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.07, execute: work)
+        case .software:
+            if audioManager.isSoftwareVolumeActive {
+                // 已激活时直接原子更新实时增益，零延迟无卡顿
+                _ = audioManager.setCurrentVolume(clamped)
+                softwareVolumeError = nil
+            } else {
+                // 首次拖动合并为单次后台激活，避免并发多次创建 Process Tap
+                pendingVolumeWorkItem?.cancel()
+                let audioMgr = audioManager
+                let work = DispatchWorkItem {
+                    Task.detached(priority: .userInitiated) {
+                        let ok = audioMgr.setCurrentVolume(clamped)
+                        let err = audioMgr.softwareVolumeLastError
+                        await MainActor.run { [weak self] in
+                            guard let self else { return }
+                            self.softwareVolumeError = ok ? nil : err
+                            if !ok, let err {
+                                self.showBanner(err, isError: true)
+                            }
+                        }
+                    }
+                }
+                pendingVolumeWorkItem = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+            }
         case .unsupported:
             break
         }
@@ -698,12 +808,18 @@ final class AppViewModel: ObservableObject {
             isMuted = snap.isMuted
         } else {
             Task.detached(priority: .userInitiated) {
-                _ = audioMgr.setCurrentMuted(nextMuted)
+                let ok = audioMgr.setCurrentMuted(nextMuted)
+                let err = audioMgr.softwareVolumeLastError
                 let snap = audioMgr.currentVolumeSnapshot(readHardwareDDC: false)
                 await MainActor.run { [weak self] in
                     guard let self else { return }
                     self.volume = snap.volume
                     self.isMuted = snap.isMuted
+                    self.volumeMode = snap.mode
+                    self.softwareVolumeError = ok ? nil : err
+                    if !ok, let err {
+                        self.showBanner(err, isError: true)
+                    }
                     if case .ddc(let idx, _) = snap.mode {
                         self.ddcVolumes[idx] = snap.volume
                         self.ddcMuted[idx] = snap.isMuted
@@ -819,6 +935,30 @@ final class AppViewModel: ObservableObject {
 
     func toggleAutoRestore() {
         onToggleAutoRestore()
+    }
+
+    func toggleSoftwareVolumeEnabled() {
+        isSoftwareVolumeEnabled.toggle()
+        UserDefaults.standard.set(isSoftwareVolumeEnabled, forKey: Self.softwareVolumeKey)
+        audioManager.isSoftwareVolumeEnabled = isSoftwareVolumeEnabled
+        softwareVolumeError = nil
+        refresh(readHardwareDDC: false)
+        showBanner(
+            isSoftwareVolumeEnabled ? "已启用免驱动软件音量" : "已关闭免驱动软件音量",
+            isError: false
+        )
+    }
+
+    func openSystemAudioRecordingSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        ]
+        for raw in candidates {
+            if let url = URL(string: raw), NSWorkspace.shared.open(url) {
+                return
+            }
+        }
     }
 
     func openMainWindow(section: MainWindowSection? = nil) {

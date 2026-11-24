@@ -220,15 +220,15 @@ struct MainAppRootView: View {
     private var subtitleForCurrentSection: String {
         switch viewModel.mainSection {
         case .displays:
-            return "独立控制每台显示器的开关、主屏幕 / 拓展 / 镜像模式、输入源与自定义命名"
+            return "独立控制每台显示器的开关、主屏幕 / 拓展 / 镜像模式、硬件亮度、输入源与自定义命名"
         case .arrangement:
             return "拖拽排布多屏相对坐标与主屏位置，保存并一键切换命名布局预设"
         case .disableRules:
             return "为任意屏幕定制“关闭它之后剩余屏幕的排布与主屏”，重新开启时自动恢复"
         case .audio:
-            return "切换系统音频输出设备，统一调节系统音量与外接屏 DDC/CI 硬件音量"
+            return "切换系统音频输出设备，统一调节系统音量、外接屏 DDC/CI 硬件音量与免驱动软件音量"
         case .settings:
-            return "开机自启动、退出安全恢复策略与 DDC/CI 输入源协议偏好"
+            return "开机自启动、免驱动软件音量、退出安全恢复策略与 DDC/CI 输入源协议偏好"
         }
     }
 
@@ -480,6 +480,7 @@ struct MainAppRootView: View {
                                 switch viewModel.volumeMode {
                                 case .coreAudio: return .blue
                                 case .ddc: return .teal
+                                case .software: return .purple
                                 case .unsupported: return .secondary
                                 }
                             }()
@@ -513,6 +514,18 @@ struct MainAppRootView: View {
                         Text(viewModel.volumeMode == .unsupported ? "--" : "\(Int((viewModel.isMuted ? 0 : viewModel.volume * 100).rounded()))%")
                             .font(.system(size: 14, weight: .semibold, design: .monospaced))
                             .frame(width: 44, alignment: .trailing)
+                    }
+
+                    if case .software = viewModel.volumeMode, viewModel.softwareVolumeError == nil {
+                        Text("当前外接显示器无硬件音量控制，已自动启用 macOS 原生免驱动软件音量引擎（首次调节会请求一次「仅系统音频录制」权限）。")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let err = viewModel.softwareVolumeError {
+                        SoftwareVolumeErrorRow(message: err) {
+                            viewModel.openSystemAudioRecordingSettings()
+                        }
                     }
                 }
             }
@@ -566,14 +579,14 @@ struct MainAppRootView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("外接显示器独立音量（DDC/CI）")
                             .font(.system(size: 13.5, weight: .semibold))
-                        if viewModel.ddcEndpoints.isEmpty {
-                            Text("当前未检测到支持 DDC/CI 的外接显示器。")
+                        if viewModel.ddcVolumeEndpoints.isEmpty {
+                            Text("当前未检测到支持 DDC/CI 硬件音量的外接显示器（无硬件音量的显示器会自动走上方免驱动软件音量）。")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                                 .padding(.vertical, 8)
                         } else {
                             VStack(spacing: 10) {
-                                ForEach(viewModel.ddcEndpoints) { ep in
+                                ForEach(viewModel.ddcVolumeEndpoints) { ep in
                                     let epVol = viewModel.ddcVolumes[ep.index] ?? 0.5
                                     let epMuted = viewModel.ddcMuted[ep.index] ?? false
                                     let isLinked = (viewModel.activeDDCEndpointIndex == ep.index)
@@ -654,6 +667,39 @@ struct MainAppRootView: View {
                             set: { _ in viewModel.toggleAutoRestore() }
                         )
                     )
+                }
+            }
+
+            SurfaceCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("免驱动软件音量（macOS 14.2+）")
+                        .font(.system(size: 13.5, weight: .semibold))
+                    Text("当外接显示器既不支持系统 CoreAudio 音量，也不支持 DDC/CI 硬件音量（例如 Dell U2718Q、EIZO EV3895 等固定电平输出设备）时，使用 macOS 原生 Audio Process Tap 实时调节音量，无需安装任何虚拟声卡驱动。")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    Toggle(
+                        "对无硬件音量的外接显示器启用免驱动软件音量",
+                        isOn: Binding(
+                            get: { viewModel.isSoftwareVolumeEnabled },
+                            set: { _ in viewModel.toggleSoftwareVolumeEnabled() }
+                        )
+                    )
+                    .disabled(!viewModel.isSoftwareVolumeSupported)
+
+                    HStack {
+                        if !viewModel.isSoftwareVolumeSupported {
+                            Text("当前系统版本低于 macOS 14.2，暂不支持此功能。")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        } else {
+                            Button("打开「仅系统音频录制」隐私设置") {
+                                viewModel.openSystemAudioRecordingSettings()
+                            }
+                            .controlSize(.small)
+                        }
+                        Spacer()
+                    }
                 }
             }
 

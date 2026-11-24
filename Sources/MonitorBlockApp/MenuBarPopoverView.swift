@@ -230,6 +230,18 @@ struct MenuBarPopoverView: View {
                             .foregroundColor(.secondary)
                             .frame(width: 38, alignment: .trailing)
                     }
+
+                    if case .software = viewModel.volumeMode, viewModel.softwareVolumeError == nil {
+                        Text("此显示器不支持硬件音量，拖动滑块将通过免驱动软件音量实时调节")
+                            .font(.system(size: 10))
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let err = viewModel.softwareVolumeError {
+                        SoftwareVolumeErrorRow(message: err) {
+                            viewModel.openSystemAudioRecordingSettings()
+                        }
+                    }
                 }
             }
 
@@ -254,8 +266,8 @@ struct MenuBarPopoverView: View {
                 }
             }
 
-            // 外接显示器独立 DDC 硬件音量
-            if !viewModel.ddcEndpoints.isEmpty {
+            // 外接显示器独立 DDC 硬件音量（仅展示真实支持 DDC 0x62 的显示器）
+            if !viewModel.ddcVolumeEndpoints.isEmpty {
                 SurfaceCard {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -266,7 +278,7 @@ struct MenuBarPopoverView: View {
                         }
 
                         VStack(spacing: 8) {
-                            ForEach(viewModel.ddcEndpoints) { ep in
+                            ForEach(viewModel.ddcVolumeEndpoints) { ep in
                                 ddcVolumeRow(ep)
                             }
                         }
@@ -360,6 +372,7 @@ struct MenuBarPopoverView: View {
         switch viewModel.volumeMode {
         case .coreAudio: return .blue
         case .ddc: return .teal
+        case .software: return .purple
         case .unsupported: return .secondary
         }
     }

@@ -60,10 +60,14 @@ public final class CoreAudioBackend: AudioBackend {
 
         return deviceIDs.compactMap { deviceID -> AudioOutputDevice? in
             guard hasOutputStreams(deviceID: deviceID) else { return nil }
-            let name = stringProperty(deviceID: deviceID, selector: kAudioDevicePropertyDeviceNameCFString)
-                ?? "音频设备 #\(deviceID)"
             let uid = stringProperty(deviceID: deviceID, selector: kAudioDevicePropertyDeviceUID)
                 ?? "audio-\(deviceID)"
+            // 过滤本应用创建的私有软件音量聚合设备，避免出现在用户的输出设备列表中
+            if uid.hasPrefix("local.cliecy.MonitorBlock.SoftVol.") {
+                return nil
+            }
+            let name = stringProperty(deviceID: deviceID, selector: kAudioDevicePropertyDeviceNameCFString)
+                ?? "音频设备 #\(deviceID)"
             let transport = transportType(deviceID: deviceID)
             let supportsVolume = supportsCoreAudioVolumeControl(deviceID: deviceID)
 
@@ -400,13 +404,16 @@ public final class CoreAudioBackend: AudioBackend {
     }
 }
 
-/// 统一管理音频输出切换、CoreAudio 音量与外接显示器 DDC/CI 硬件音量及输入源
+/// 统一管理音频输出切换、CoreAudio 音量、外接显示器 DDC/CI（亮度/音量/输入源/能力探测）与免驱动软件音量
 public final class AudioManager: @unchecked Sendable {
     private let audioBackend: AudioBackend
     private let ddcBackend: DDCBackend
+    private let softwareVolume: SoftwareVolumeBackend
     private let store: StateStoreProtocol
     private let lock = NSLock()
     private var cachedDDCVolumes: [Int: Int] = [:]
+    private var cachedDDCBrightness: [Int: Int] = [:]
+    private var cachedCapabilities: [String: DDCCapabilities] = [:] // endpoint.storageKey -> capabilities
     private var preMuteDDCVolumes: [Int: Int] = [:]
     private var cachedDDCMuted: [Int: Bool] = [:]
     private var preferredDDCEndpointByAudioUID: [String: Int]
@@ -414,19 +421,56 @@ public final class AudioManager: @unchecked Sendable {
     private var calibratedInputCodes: [String: [String: DDCInputCode]]
     private var cachedInputStatuses: [Int: DisplayInputStatus] = [:]
     private var knownDisplays: [DisplayInfo] = []
+    private var savedSoftwareVolumes: [String: Double] = [:] // audioDevice.uid -> 0.0...1.0
+    private var savedSoftwareMuted: [String: Bool] = [:]
+    private var _isSoftwareVolumeEnabled: Bool = true
+
+    public var isSoftwareVolumeSupported: Bool {
+        softwareVolume.isSupported
+    }
+
+    public var isSoftwareVolumeActive: Bool {
+        softwareVolume.isActive
+    }
+
+    public var isSoftwareVolumeEnabled: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _isSoftwareVolumeEnabled
+        }
+        set {
+            lock.lock()
+            _isSoftwareVolumeEnabled = newValue
+            lock.unlock()
+            if !newValue {
+                softwareVolume.deactivate()
+            }
+        }
+    }
+
+    public var softwareVolumeLastError: String? {
+        softwareVolume.lastError
+    }
 
     public init(
         audioBackend: AudioBackend = CoreAudioBackend(),
         ddcBackend: DDCBackend = AppleSiliconDDCBackend(),
+        softwareVolume: SoftwareVolumeBackend = CoreAudioProcessTapVolumeEngine(),
         store: StateStoreProtocol = FileStateStore()
     ) {
         self.audioBackend = audioBackend
         self.ddcBackend = ddcBackend
+        self.softwareVolume = softwareVolume
         self.store = store
         let loaded = store.loadState()
         self.preferredDDCEndpointByAudioUID = loaded.audioToDDCBindings
         self.preferredDDCKeyByDisplayUUID = loaded.displayToDDCBindings
         self.calibratedInputCodes = loaded.calibratedInputCodes
+    }
+
+    public func stopSoftwareVolume() {
+        softwareVolume.deactivate()
     }
 
     public func updateKnownDisplays(_ displays: [DisplayInfo]) {
@@ -441,8 +485,12 @@ public final class AudioManager: @unchecked Sendable {
 
     public func listDDCEndpoints() -> [DDCDisplayEndpoint] {
         ddcBackend.listEndpoints().map { endpoint in
+            lock.lock()
             let cachedVol = cachedDDCVolumes[endpoint.index]
+            let cachedBright = cachedDDCBrightness[endpoint.index]
             let cachedMute = cachedDDCMuted[endpoint.index] ?? false
+            let caps = cachedCapabilities[endpoint.storageKey]
+            lock.unlock()
             return DDCDisplayEndpoint(
                 index: endpoint.index,
                 name: endpoint.name,
@@ -450,24 +498,100 @@ public final class AudioManager: @unchecked Sendable {
                 numericSerial: endpoint.numericSerial,
                 registryPath: endpoint.registryPath,
                 currentVolume: cachedVol,
-                isMuted: cachedMute
+                currentBrightness: cachedBright,
+                isMuted: cachedMute,
+                capabilities: caps
             )
         }
     }
 
+    /// 探测并缓存某台外接屏的 MCCS Capabilities 与当前硬件亮度（建议在后台线程调用）
     @discardableResult
-    public func selectOutputDevice(id: UInt32) -> Bool {
-        audioBackend.setDefaultOutputDevice(id: id)
+    public func probeCapabilitiesAndBrightness(endpointIndex: Int, force: Bool = false) -> DDCCapabilities {
+        let endpoints = ddcBackend.listEndpoints()
+        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else {
+            return .unreachable
+        }
+
+        lock.lock()
+        let existing = cachedCapabilities[endpoint.storageKey]
+        lock.unlock()
+
+        let caps: DDCCapabilities
+        if !force, let existing {
+            caps = existing
+        } else {
+            caps = ddcBackend.probeCapabilities(endpointIndex: endpointIndex)
+            lock.lock()
+            cachedCapabilities[endpoint.storageKey] = caps
+            lock.unlock()
+        }
+
+        if caps.isReachable && caps.supportsBrightness,
+           let brightness = ddcBackend.readBrightness(endpointIndex: endpointIndex) {
+            lock.lock()
+            cachedDDCBrightness[endpointIndex] = brightness
+            lock.unlock()
+        }
+        if caps.isReachable && caps.supportsVolume,
+           let vol = ddcBackend.readVolume(endpointIndex: endpointIndex) {
+            lock.lock()
+            cachedDDCVolumes[endpointIndex] = vol
+            lock.unlock()
+        }
+
+        return caps
     }
 
-    /// 读取当前默认输出设备的音量快照（若为不支持系统音量的外接屏，自动桥接 DDC/CI）
-    public func currentVolumeSnapshot(readHardwareDDC: Bool = false) -> AudioVolumeSnapshot {
+    public func cachedCapabilities(for endpoint: DDCDisplayEndpoint) -> DDCCapabilities? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cachedCapabilities[endpoint.storageKey]
+    }
+
+    public func readDDCBrightness(endpointIndex: Int) -> Int? {
+        if let val = ddcBackend.readBrightness(endpointIndex: endpointIndex) {
+            lock.lock()
+            cachedDDCBrightness[endpointIndex] = val
+            lock.unlock()
+            return val
+        }
+        return nil
+    }
+
+    @discardableResult
+    public func setDDCBrightness(_ percent: Int, endpointIndex: Int) -> Bool {
+        let clamped = min(max(percent, 0), 100)
+        lock.lock()
+        cachedDDCBrightness[endpointIndex] = clamped
+        lock.unlock()
+        return ddcBackend.setBrightness(clamped, endpointIndex: endpointIndex)
+    }
+
+    @discardableResult
+    public func selectOutputDevice(id: UInt32) -> Bool {
+        let ok = audioBackend.setDefaultOutputDevice(id: id)
+        if ok {
+            // 切换输出设备后先停止旧设备的软件音量代理，等待新设备判定是否需要
+            softwareVolume.deactivate()
+        }
+        return ok
+    }
+
+    /// 读取当前默认输出设备的音量快照：CoreAudio -> DDC 硬件音量 -> 软件音量（按需启用）
+    public func currentVolumeSnapshot(
+        readHardwareDDC: Bool = false,
+        activateSoftwareVolumeIfNeeded: Bool = false
+    ) -> AudioVolumeSnapshot {
         let devices = audioBackend.listOutputDevices()
         guard let active = devices.first(where: \.isDefault) ?? devices.first else {
+            softwareVolume.deactivate()
             return AudioVolumeSnapshot(deviceID: nil, deviceName: nil, volume: 0, isMuted: false, mode: .unsupported)
         }
 
+        // 1. 支持原生 CoreAudio 音量 -> 直接走系统硬件音量，释放软件音量代理
         if active.supportsCoreAudioVolume {
+            softwareVolume.deactivate()
             let vol = audioBackend.readCoreAudioVolume(deviceID: active.id) ?? 0.5
             let muted = audioBackend.readCoreAudioMuted(deviceID: active.id) ?? false
             return AudioVolumeSnapshot(
@@ -479,26 +603,83 @@ public final class AudioManager: @unchecked Sendable {
             )
         }
 
+        // 2. 尝试匹配 DDC/CI 硬件音量（仅当端点可达且支持 VCP 0x62 时使用）
         if let endpoint = matchDDCEndpoint(for: active, allDevices: devices) {
-            let level: Int
-            if let cached = cachedDDCVolumes[endpoint.index] {
-                level = cached
-            } else if readHardwareDDC, let hw = ddcBackend.readVolume(endpointIndex: endpoint.index) {
-                cachedDDCVolumes[endpoint.index] = hw
-                level = hw
+            lock.lock()
+            let caps = cachedCapabilities[endpoint.storageKey]
+            lock.unlock()
+
+            let ddcVolumeAllowed: Bool
+            if let caps {
+                ddcVolumeAllowed = caps.isReachable && caps.supportsVolume
             } else {
-                level = 50
+                // 尚未完成异步能力探测时，暂不盲目判定不可用
+                ddcVolumeAllowed = true
             }
-            let muted = cachedDDCMuted[endpoint.index] ?? false
+
+            if ddcVolumeAllowed {
+                softwareVolume.deactivate()
+                let level: Int
+                if let cached = cachedDDCVolumes[endpoint.index] {
+                    level = cached
+                } else if readHardwareDDC, let hw = ddcBackend.readVolume(endpointIndex: endpoint.index) {
+                    cachedDDCVolumes[endpoint.index] = hw
+                    level = hw
+                } else {
+                    level = 50
+                }
+                let muted = cachedDDCMuted[endpoint.index] ?? false
+                return AudioVolumeSnapshot(
+                    deviceID: active.id,
+                    deviceName: endpoint.name,
+                    volume: Double(level) / 100.0,
+                    isMuted: muted,
+                    mode: .ddc(ddcIndex: endpoint.index, displayName: endpoint.name)
+                )
+            }
+        }
+
+        // 3. 硬件既不支持 CoreAudio 也不支持 DDC 音量（如 Dell U2718Q / EIZO EV3895）-> 自动回退免驱动软件音量引擎
+        if isSoftwareVolumeEnabled && softwareVolume.isSupported {
+            if softwareVolume.isActive && softwareVolume.activeTargetUID != active.uid {
+                softwareVolume.deactivate()
+            }
+            lock.lock()
+            let savedVol = savedSoftwareVolumes[active.uid] ?? 1.0
+            let savedMute = savedSoftwareMuted[active.uid] ?? false
+            lock.unlock()
+
+            if activateSoftwareVolumeIfNeeded || (softwareVolume.isActive && softwareVolume.activeTargetUID == active.uid) {
+                do {
+                    try softwareVolume.activate(targetDeviceUID: active.uid, volume: savedVol, muted: savedMute)
+                } catch {
+                    return AudioVolumeSnapshot(
+                        deviceID: active.id,
+                        deviceName: active.name,
+                        volume: savedVol,
+                        isMuted: savedMute,
+                        mode: .unsupported
+                    )
+                }
+            }
+
+            let vol = (softwareVolume.isActive && softwareVolume.activeTargetUID == active.uid)
+                ? softwareVolume.currentVolume
+                : savedVol
+            let muted = (softwareVolume.isActive && softwareVolume.activeTargetUID == active.uid)
+                ? softwareVolume.isMuted
+                : savedMute
+
             return AudioVolumeSnapshot(
                 deviceID: active.id,
-                deviceName: endpoint.name,
-                volume: Double(level) / 100.0,
+                deviceName: active.name,
+                volume: vol,
                 isMuted: muted,
-                mode: .ddc(ddcIndex: endpoint.index, displayName: endpoint.name)
+                mode: .software(deviceName: active.name)
             )
         }
 
+        softwareVolume.deactivate()
         return AudioVolumeSnapshot(
             deviceID: active.id,
             deviceName: active.name,
@@ -511,7 +692,7 @@ public final class AudioManager: @unchecked Sendable {
     @discardableResult
     public func setCurrentVolume(_ volume: Double) -> Bool {
         let clamped = min(max(volume, 0.0), 1.0)
-        let snapshot = currentVolumeSnapshot(readHardwareDDC: false)
+        let snapshot = currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)
 
         switch snapshot.mode {
         case .coreAudio:
@@ -525,6 +706,27 @@ public final class AudioManager: @unchecked Sendable {
             let percent = Int((clamped * 100.0).rounded())
             return setDDCVolume(percent, endpointIndex: ddcIndex)
 
+        case .software:
+            guard let deviceID = snapshot.deviceID,
+                  let active = audioBackend.listOutputDevices().first(where: { $0.id == deviceID }) else {
+                return false
+            }
+            lock.lock()
+            savedSoftwareVolumes[active.uid] = clamped
+            if clamped > 0.001 {
+                savedSoftwareMuted[active.uid] = false
+            }
+            let mutedNow = savedSoftwareMuted[active.uid] ?? false
+            lock.unlock()
+
+            do {
+                try softwareVolume.activate(targetDeviceUID: active.uid, volume: clamped, muted: mutedNow)
+                softwareVolume.setVolume(clamped)
+                return true
+            } catch {
+                return false
+            }
+
         case .unsupported:
             return false
         }
@@ -532,7 +734,7 @@ public final class AudioManager: @unchecked Sendable {
 
     @discardableResult
     public func setCurrentMuted(_ muted: Bool) -> Bool {
-        let snapshot = currentVolumeSnapshot(readHardwareDDC: false)
+        let snapshot = currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)
 
         switch snapshot.mode {
         case .coreAudio:
@@ -541,6 +743,24 @@ public final class AudioManager: @unchecked Sendable {
 
         case .ddc(let ddcIndex, _):
             return setDDCMuted(muted, endpointIndex: ddcIndex)
+
+        case .software:
+            guard let deviceID = snapshot.deviceID,
+                  let active = audioBackend.listOutputDevices().first(where: { $0.id == deviceID }) else {
+                return false
+            }
+            lock.lock()
+            savedSoftwareMuted[active.uid] = muted
+            let volNow = savedSoftwareVolumes[active.uid] ?? 1.0
+            lock.unlock()
+
+            do {
+                try softwareVolume.activate(targetDeviceUID: active.uid, volume: volNow, muted: muted)
+                softwareVolume.setMuted(muted)
+                return true
+            } catch {
+                return false
+            }
 
         case .unsupported:
             return false

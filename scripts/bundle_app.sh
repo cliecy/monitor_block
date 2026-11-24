@@ -48,13 +48,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4.2</string>
+    <string>1.5.0</string>
     <key>CFBundleVersion</key>
-    <string>11</string>
+    <string>12</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>用于在无硬件音量的外接显示器（如部分 HDMI/DP 显示器）上提供免驱动软件音量调节，不会录制、保存或上传任何音频。</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
