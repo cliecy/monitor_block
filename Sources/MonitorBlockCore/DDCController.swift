@@ -11,13 +11,28 @@ public protocol DDCBackend: AnyObject {
     func readVolume(endpointIndex: Int) -> Int?
     func setVolume(_ volume: Int, endpointIndex: Int) -> Bool
     func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool
-    func readInputSource(endpointIndex: Int) -> DDCInputReadResult
+    func readInputSource(endpointIndex: Int, hint: DDCDisplayHint) -> DDCInputReadResult
     func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool
     func setInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
-        protocolMode: InputSourceProtocolMode
+        protocolMode: InputSourceProtocolMode,
+        hint: DDCDisplayHint
     ) -> Bool
+}
+
+public extension DDCBackend {
+    func readInputSource(endpointIndex: Int) -> DDCInputReadResult {
+        readInputSource(endpointIndex: endpointIndex, hint: DDCDisplayHint())
+    }
+
+    func setInputSource(
+        _ source: DisplayInputSource,
+        endpointIndex: Int,
+        protocolMode: InputSourceProtocolMode
+    ) -> Bool {
+        setInputSource(source, endpointIndex: endpointIndex, protocolMode: protocolMode, hint: DDCDisplayHint())
+    }
 }
 
 private typealias IOAVServiceCreateWithServiceFunc = @convention(c) (
@@ -247,13 +262,13 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         )
     }
 
-    public func readInputSource(endpointIndex: Int) -> DDCInputReadResult {
+    public func readInputSource(endpointIndex: Int, hint: DDCDisplayHint = DDCDisplayHint()) -> DDCInputReadResult {
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else {
             return DDCInputReadResult()
         }
         let target = services[endpointIndex]
-        let isLG = target.name.lowercased().contains("lg")
+        let isLG = hint.isLG || target.name.lowercased().contains("lg")
 
         let stdRaw = readVCPRaw(
             code: Self.vcpInputSelectStandard,
@@ -263,14 +278,17 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         let stdVal = stdRaw.map { $0 & 0xFF }
 
         var lgVal: UInt16? = nil
-        if isLG {
-            usleep(20_000)
+        // LG 显示器（含 CoreGraphics 识别出的 0x1E6D LG 机型）或标准 0x60 返回 0x00 占位值时，尝试回读 0x50/0xF4
+        if isLG || stdVal == 0 {
+            usleep(25_000)
             let lgRaw = readVCPRaw(
                 code: Self.vcpInputSelectLGAlt,
                 service: target.service,
                 dataAddress: Self.dataAddressLGAlt
             )
-            lgVal = lgRaw.map { $0 & 0xFF }
+            if let mapped = lgRaw.map({ $0 & 0xFF }), mapped > 0 {
+                lgVal = mapped
+            }
         }
 
         return DDCInputReadResult(standardValue: stdVal, lgAltValue: lgVal)
@@ -290,16 +308,19 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     public func setInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
-        protocolMode: InputSourceProtocolMode = .auto
+        protocolMode: InputSourceProtocolMode = .auto,
+        hint: DDCDisplayHint = DDCDisplayHint()
     ) -> Bool {
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return false }
         let target = services[endpointIndex]
 
+        let stdCodes = resolvedStandardCodes(for: source, hint: hint)
+
         switch protocolMode {
         case .standard:
             return sendCandidates(
-                source.standardCandidateCodes,
+                stdCodes,
                 vcpCode: Self.vcpInputSelectStandard,
                 dataAddress: Self.dataAddressStandard,
                 service: target.service
@@ -314,27 +335,71 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             )
 
         case .auto:
-            let isLG = target.name.lowercased().contains("lg")
-            if isLG {
-                // 对 LG 先发专有 0x50/0xF4 候选码（USB-C 会依次发 0xD1、0xD2），间隔足够时间后再补标准 0x51/0x60
+            let isLG = hint.isLG || target.name.lowercased().contains("lg")
+            let hasExplicitMCCS60 = !(hint.capabilities?.supportedInputCodes.isEmpty ?? true)
+
+            // 1. 明确为非 LG 品牌（如实验室 DELL 0x10AC、BenQ、ASUS 等）或 0xF3 明确声明了标准 60(...) 列表的非 LG 屏：
+            //    100% 纯粹走标准 MCCS 0x51/0x60（且优先直发 0xF3 声明的精确单码，绝不向 DELL 误发 LG 私有 0x50/0xF4）
+            if !isLG && (hint.isKnownNonLG || hasExplicitMCCS60) {
+                return sendCandidates(
+                    stdCodes,
+                    vcpCode: Self.vcpInputSelectStandard,
+                    dataAddress: Self.dataAddressStandard,
+                    service: target.service
+                )
+            }
+
+            // 2. LG 显示器（vendorID == 0x1E6D）或未知厂商：先读一次 0x60 判定固件形态
+            let preStd = readVCPRaw(
+                code: Self.vcpInputSelectStandard,
+                service: target.service,
+                dataAddress: Self.dataAddressStandard
+            ).map { $0 & 0xFF }
+            usleep(25_000)
+
+            let stdIsDummy = (preStd == 0)
+
+            if isLG || stdIsDummy {
                 let altOK = sendCandidates(
                     source.lgAltCandidateCodes,
                     vcpCode: Self.vcpInputSelectLGAlt,
                     dataAddress: Self.dataAddressLGAlt,
                     service: target.service
                 )
-                usleep(60_000)
-                let stdOK = sendCandidates(
-                    source.standardCandidateCodes,
-                    vcpCode: Self.vcpInputSelectStandard,
-                    dataAddress: Self.dataAddressStandard,
-                    service: target.service
-                )
-                return altOK || stdOK
+                if !altOK {
+                    usleep(60_000)
+                    return sendCandidates(
+                        stdCodes,
+                        vcpCode: Self.vcpInputSelectStandard,
+                        dataAddress: Self.dataAddressStandard,
+                        service: target.service
+                    )
+                }
+
+                // 当 0x60 读出为 0x00 或无返回（典型仅支持 0xF4 的 LG 固件）时不再追加 0x60，防止冲掉正在进行的 0xF4 切换；
+                // 仅当该 LG 屏真实返回了非零 0x60（如老款 DP 模式 LG）且等待后端口仍未变化时，才补发标准 0x60 兜底。
+                if let pre = preStd, pre > 0, !stdCodes.contains(pre) {
+                    usleep(280_000)
+                    let postStd = readVCPRaw(
+                        code: Self.vcpInputSelectStandard,
+                        service: target.service,
+                        dataAddress: Self.dataAddressStandard
+                    ).map { $0 & 0xFF }
+                    if postStd == pre {
+                        usleep(30_000)
+                        let stdOK = sendCandidates(
+                            stdCodes,
+                            vcpCode: Self.vcpInputSelectStandard,
+                            dataAddress: Self.dataAddressStandard,
+                            service: target.service
+                        )
+                        return altOK || stdOK
+                    }
+                }
+                return true
             } else {
-                // 其他品牌优先标准 MCCS 0x60，失败时自动回退尝试 0x50/0xF4
                 let stdOK = sendCandidates(
-                    source.standardCandidateCodes,
+                    stdCodes,
                     vcpCode: Self.vcpInputSelectStandard,
                     dataAddress: Self.dataAddressStandard,
                     service: target.service
@@ -350,6 +415,13 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         }
     }
 
+    private func resolvedStandardCodes(for source: DisplayInputSource, hint: DDCDisplayHint) -> [UInt16] {
+        if let exact = hint.capabilities?.supportedInputCodes[source] {
+            return [exact]
+        }
+        return source.standardCandidateCodes
+    }
+
     private func sendCandidates(
         _ values: [UInt16],
         vcpCode: UInt8,
@@ -359,7 +431,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         var anyOK = false
         for (idx, val) in values.enumerated() {
             if idx > 0 {
-                usleep(60_000)
+                usleep(120_000)
             }
             if writeVCP(code: vcpCode, value: val, service: service, dataAddress: dataAddress) {
                 anyOK = true

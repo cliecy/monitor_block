@@ -252,6 +252,8 @@ struct InputSourceControlStrip: View {
         let activeSource = status?.activeSource
         let switchingTarget = viewModel.switchingInputs[endpointIndex]
         let visibleSources = supportedSources.isEmpty ? DisplayInputSource.allCases : supportedSources
+        let perDisplayProtocol = viewModel.displayInputProtocols[displayUUID]
+        let protocolSummary = perDisplayProtocol.map { "\($0.label)（此屏专属）" } ?? "跟随默认（\(viewModel.inputProtocolMode.label)）"
 
         HStack(spacing: 5) {
             HStack(spacing: 3) {
@@ -261,7 +263,12 @@ struct InputSourceControlStrip: View {
                     let isCalibrated = (status?.calibratedCodes[source] != nil)
 
                     Button {
-                        viewModel.switchInputSource(source, endpointIndex: endpointIndex, displayName: displayName)
+                        viewModel.switchInputSource(
+                            source,
+                            displayUUID: displayUUID,
+                            endpointIndex: endpointIndex,
+                            displayName: displayName
+                        )
                     } label: {
                         HStack(spacing: 3) {
                             if isSwitchingThis {
@@ -296,30 +303,79 @@ struct InputSourceControlStrip: View {
 
                 Divider()
 
-                Menu("将当前亮屏端口校准为…") {
+                Menu("此屏协议：\(protocolSummary)") {
+                    Button {
+                        viewModel.setDisplayInputProtocol(nil, for: displayUUID, displayName: displayName)
+                    } label: {
+                        if perDisplayProtocol == nil {
+                            Text("✓ 跟随全局默认（\(viewModel.inputProtocolMode.label)）")
+                        } else {
+                            Text("跟随全局默认（\(viewModel.inputProtocolMode.label)）")
+                        }
+                    }
+                    Divider()
+                    ForEach(InputSourceProtocolMode.allCases) { mode in
+                        Button {
+                            viewModel.setDisplayInputProtocol(mode, for: displayUUID, displayName: displayName)
+                        } label: {
+                            if perDisplayProtocol == mode {
+                                Text("✓ \(mode.label)")
+                            } else {
+                                Text(mode.label)
+                            }
+                        }
+                    }
+                }
+
+                Menu("手动指定端口硬件码…") {
+                    ForEach(DisplayInputSource.allCases) { source in
+                        let currentBound = status?.calibratedCodes[source]
+                        let titleSuffix = currentBound.map { " (\($0.hexSummary))" } ?? ""
+                        Menu("\(source.label)\(titleSuffix)") {
+                            ForEach(Array(DDCInputCode.commonPresets(for: source).enumerated()), id: \.offset) { _, preset in
+                                Button {
+                                    viewModel.setManualInputCode(
+                                        preset.code,
+                                        for: source,
+                                        displayUUID: displayUUID,
+                                        endpointIndex: endpointIndex,
+                                        displayName: displayName
+                                    )
+                                } label: {
+                                    if currentBound == preset.code {
+                                        Text("✓ \(preset.label)")
+                                    } else {
+                                        Text(preset.label)
+                                    }
+                                }
+                            }
+                            if currentBound != nil {
+                                Divider()
+                                Button("恢复默认自动编码") {
+                                    viewModel.setManualInputCode(
+                                        nil,
+                                        for: source,
+                                        displayUUID: displayUUID,
+                                        endpointIndex: endpointIndex,
+                                        displayName: displayName
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Menu("将当前亮屏端口自动校准为…") {
                     ForEach(DisplayInputSource.allCases) { source in
                         let existing = status?.calibratedCodes[source]
                         let suffix = existing.map { " (\($0.hexSummary))" } ?? ""
                         Button("\(source.label)\(suffix)") {
                             viewModel.calibrateCurrentInput(
                                 as: source,
+                                displayUUID: displayUUID,
                                 endpointIndex: endpointIndex,
                                 displayName: displayName
                             )
-                        }
-                    }
-                }
-
-                Menu("切换协议：\(viewModel.inputProtocolMode.label)") {
-                    ForEach(InputSourceProtocolMode.allCases) { mode in
-                        Button {
-                            viewModel.setInputProtocolMode(mode)
-                        } label: {
-                            if viewModel.inputProtocolMode == mode {
-                                Text("✓ \(mode.label)")
-                            } else {
-                                Text(mode.label)
-                            }
                         }
                     }
                 }
@@ -345,12 +401,16 @@ struct InputSourceControlStrip: View {
                 Divider()
 
                 Button("重新读取当前输入源") {
-                    viewModel.refreshSingleInputStatusAsync(endpointIndex: endpointIndex)
+                    viewModel.refreshSingleInputStatusAsync(endpointIndex: endpointIndex, displayUUID: displayUUID)
                 }
 
                 if !(status?.calibratedCodes.isEmpty ?? true) {
-                    Button("重置此屏端口校准", role: .destructive) {
-                        viewModel.resetInputCalibration(endpointIndex: endpointIndex, displayName: displayName)
+                    Button("重置此屏全部端口校准", role: .destructive) {
+                        viewModel.resetInputCalibration(
+                            displayUUID: displayUUID,
+                            endpointIndex: endpointIndex,
+                            displayName: displayName
+                        )
                     }
                 }
             } label: {
@@ -472,7 +532,7 @@ struct DisplayControlCard: View {
                                 Slider(
                                     value: Binding(
                                         get: { bright },
-                                        set: { viewModel.updateDDCBrightness(endpointIndex: idx, value: $0) }
+                                        set: { viewModel.updateDDCBrightness(endpointIndex: idx, displayUUID: display.uuid, value: $0) }
                                     ),
                                     in: 0...1
                                 )

@@ -75,6 +75,8 @@ public struct DDCCapabilities: Equatable, Sendable {
     public let supportsVolume: Bool
     /// 解析出的真实物理输入口；nil 表示未返回 0xF3 或未能解析，UI 回退展示全部常用输入源
     public let supportedInputs: [DisplayInputSource]?
+    /// 从 0xF3 的 60(...) 中解析出的精确标准 VCP 0x60 硬件码（例如部分新款 Dell 将 USB-C 报为 0x19 而老款报为 0x1B）
+    public let supportedInputCodes: [DisplayInputSource: UInt16]
     public let rawCapabilitiesString: String?
 
     public init(
@@ -82,12 +84,14 @@ public struct DDCCapabilities: Equatable, Sendable {
         supportsBrightness: Bool,
         supportsVolume: Bool,
         supportedInputs: [DisplayInputSource]? = nil,
+        supportedInputCodes: [DisplayInputSource: UInt16] = [:],
         rawCapabilitiesString: String? = nil
     ) {
         self.isReachable = isReachable
         self.supportsBrightness = supportsBrightness
         self.supportsVolume = supportsVolume
         self.supportedInputs = supportedInputs
+        self.supportedInputCodes = supportedInputCodes
         self.rawCapabilitiesString = rawCapabilitiesString
     }
 
@@ -164,20 +168,27 @@ public struct DDCCapabilities: Equatable, Sendable {
         guard !topCodes.isEmpty else { return nil }
 
         var parsedInputs: [DisplayInputSource]? = nil
+        var parsedInputCodes: [DisplayInputSource: UInt16] = [:]
         if !inputValues.isEmpty {
             var mapped: [DisplayInputSource] = []
             for val in inputValues {
+                let low = val & 0xFF
                 let candidate: DisplayInputSource?
-                switch val & 0xFF {
+                switch low {
                 case 0x11: candidate = .hdmi1
                 case 0x12: candidate = .hdmi2
                 case 0x0F: candidate = .displayPort1
                 case 0x10: candidate = .displayPort2
-                case 0x1B, 0x19: candidate = .usbC
+                case 0x1B, 0x19, 0x1F: candidate = .usbC
                 default: candidate = nil
                 }
-                if let candidate, !mapped.contains(candidate) {
-                    mapped.append(candidate)
+                if let candidate {
+                    if !mapped.contains(candidate) {
+                        mapped.append(candidate)
+                    }
+                    if parsedInputCodes[candidate] == nil {
+                        parsedInputCodes[candidate] = low
+                    }
                 }
             }
             if !mapped.isEmpty {
@@ -190,6 +201,7 @@ public struct DDCCapabilities: Equatable, Sendable {
             supportsBrightness: topCodes.contains(0x10),
             supportsVolume: topCodes.contains(0x62),
             supportedInputs: parsedInputs,
+            supportedInputCodes: parsedInputCodes,
             rawCapabilitiesString: raw
         )
     }
@@ -276,7 +288,55 @@ public struct DDCDisplayEndpoint: Equatable, Identifiable, Sendable {
     }
 }
 
-/// 单个信号源对应的精确硬件 DDC 编码（支持用户按真实硬件回读值一键校准）
+/// 来自 CoreGraphics / CoreDisplay 的显示器硬件身份提示（弥补 Apple Silicon DCPAVServiceProxy 缺少厂商/型号属性的问题）
+public struct DDCDisplayHint: Equatable, Sendable {
+    public static let lgVendorID: UInt32 = 0x1E6D // 7789 (LG Electronics / GSM)
+
+    public let vendorID: UInt32?
+    public let modelID: UInt32?
+    public let systemName: String?
+    public let capabilities: DDCCapabilities?
+
+    public init(
+        vendorID: UInt32? = nil,
+        modelID: UInt32? = nil,
+        systemName: String? = nil,
+        capabilities: DDCCapabilities? = nil
+    ) {
+        self.vendorID = vendorID
+        self.modelID = modelID
+        self.systemName = systemName
+        self.capabilities = capabilities
+    }
+
+    public init(display: DisplayInfo, capabilities: DDCCapabilities? = nil) {
+        self.vendorID = display.vendorID
+        self.modelID = display.modelID
+        self.systemName = display.systemName
+        self.capabilities = capabilities
+    }
+
+    public var isLG: Bool {
+        if vendorID == Self.lgVendorID {
+            return true
+        }
+        if let systemName, systemName.lowercased().contains("lg") {
+            return true
+        }
+        return false
+    }
+
+    /// 明确已知为非 LG 品牌（如 DELL 0x10AC、EIZO 0x15C3 等），严禁向其误发 LG 私有 0x50/0xF4 指令
+    public var isKnownNonLG: Bool {
+        if isLG { return false }
+        if let vendorID, vendorID != 0 {
+            return true
+        }
+        return false
+    }
+}
+
+/// 单个信号源对应的精确硬件 DDC 编码（支持用户按真实硬件回读值一键校准或手动指定）
 public struct DDCInputCode: Codable, Equatable, Sendable {
     public let dataAddress: UInt32
     public let vcpCode: UInt8
@@ -292,6 +352,39 @@ public struct DDCInputCode: Codable, Equatable, Sendable {
         let proto = (vcpCode == 0xF4 || dataAddress == 0x50) ? "LG 0xF4" : "0x60"
         return String(format: "%@=0x%02X", proto, value)
     }
+
+    /// 供「0xF4 只写不回读」的显示器（如部分 LG UltraFine HDMI 通道）手动绑定常用硬件编码
+    public static func commonPresets(for source: DisplayInputSource) -> [(label: String, code: DDCInputCode)] {
+        switch source {
+        case .hdmi1:
+            return [
+                ("LG 专有 0xF4 = 0x90 (144)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0x90)),
+                ("标准 0x60 = 0x11 (17)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x11))
+            ]
+        case .hdmi2:
+            return [
+                ("LG 专有 0xF4 = 0x91 (145)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0x91)),
+                ("标准 0x60 = 0x12 (18)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x12))
+            ]
+        case .displayPort1:
+            return [
+                ("LG 专有 0xF4 = 0xD0 (208)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0xD0)),
+                ("标准 0x60 = 0x0F (15)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x0F))
+            ]
+        case .displayPort2:
+            return [
+                ("LG 专有 0xF4 = 0xD1 (209)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0xD1)),
+                ("标准 0x60 = 0x10 (16)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x10))
+            ]
+        case .usbC:
+            return [
+                ("LG 专有 0xF4 = 0xD1 (209 · 单 DP 机型)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0xD1)),
+                ("LG 专有 0xF4 = 0xD2 (210 · 双 DP 机型)", DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0xD2)),
+                ("标准 0x60 = 0x1B (27)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x1B)),
+                ("标准 0x60 = 0x19 (25)", DDCInputCode(dataAddress: 0x51, vcpCode: 0x60, value: 0x19))
+            ]
+        }
+    }
 }
 
 /// 从显示器硬件读取到的当前输入源原始编码
@@ -306,6 +399,10 @@ public struct DDCInputReadResult: Equatable, Sendable {
 
     public var isEmpty: Bool {
         standardValue == nil && lgAltValue == nil
+    }
+
+    public var hasValidCode: Bool {
+        (standardValue ?? 0) > 0 || (lgAltValue ?? 0) > 0
     }
 
     public var preferredCode: DDCInputCode? {
@@ -464,7 +561,7 @@ public enum DisplayInputSource: String, CaseIterable, Identifiable, Equatable, S
             case 0x12: return .hdmi2
             case 0x0F: return .displayPort1
             case 0x10: return .displayPort2
-            case 0x1B, 0x19, 0xD1, 0xD2: return .usbC
+            case 0x1B, 0x19, 0x1F, 0xD1, 0xD2: return .usbC
             default: break
             }
         }

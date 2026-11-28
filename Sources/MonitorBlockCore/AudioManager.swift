@@ -411,15 +411,16 @@ public final class AudioManager: @unchecked Sendable {
     private let softwareVolume: SoftwareVolumeBackend
     private let store: StateStoreProtocol
     private let lock = NSLock()
-    private var cachedDDCVolumes: [Int: Int] = [:]
-    private var cachedDDCBrightness: [Int: Int] = [:]
-    private var cachedCapabilities: [String: DDCCapabilities] = [:] // endpoint.storageKey -> capabilities
-    private var preMuteDDCVolumes: [Int: Int] = [:]
-    private var cachedDDCMuted: [Int: Bool] = [:]
+    private var cachedDDCVolumes: [String: Int] = [:]
+    private var cachedDDCBrightness: [String: Int] = [:]
+    private var cachedCapabilities: [String: DDCCapabilities] = [:]
+    private var preMuteDDCVolumes: [String: Int] = [:]
+    private var cachedDDCMuted: [String: Bool] = [:]
     private var preferredDDCEndpointByAudioUID: [String: Int]
     private var preferredDDCKeyByDisplayUUID: [String: String]
     private var calibratedInputCodes: [String: [String: DDCInputCode]]
-    private var cachedInputStatuses: [Int: DisplayInputStatus] = [:]
+    private var displayInputProtocols: [String: InputSourceProtocolMode]
+    private var cachedInputStatuses: [String: DisplayInputStatus] = [:]
     private var knownDisplays: [DisplayInfo] = []
     private var savedSoftwareVolumes: [String: Double] = [:] // audioDevice.uid -> 0.0...1.0
     private var savedSoftwareMuted: [String: Bool] = [:]
@@ -464,9 +465,15 @@ public final class AudioManager: @unchecked Sendable {
         self.softwareVolume = softwareVolume
         self.store = store
         let loaded = store.loadState()
-        self.preferredDDCEndpointByAudioUID = loaded.audioToDDCBindings
+        // 自动清洗旧版本可能残留的冲突音频绑定（例如两台外接音频同时指向同一个整数索引 1）
+        var counts: [Int: Int] = [:]
+        for idx in loaded.audioToDDCBindings.values {
+            counts[idx, default: 0] += 1
+        }
+        self.preferredDDCEndpointByAudioUID = loaded.audioToDDCBindings.filter { counts[$0.value, default: 0] == 1 }
         self.preferredDDCKeyByDisplayUUID = loaded.displayToDDCBindings
         self.calibratedInputCodes = loaded.calibratedInputCodes
+        self.displayInputProtocols = loaded.displayInputProtocols
     }
 
     public func stopSoftwareVolume() {
@@ -484,13 +491,26 @@ public final class AudioManager: @unchecked Sendable {
     }
 
     public func listDDCEndpoints() -> [DDCDisplayEndpoint] {
-        ddcBackend.listEndpoints().map { endpoint in
+        let rawEndpoints = ddcBackend.listEndpoints()
+        lock.lock()
+        let displaysSnapshot = knownDisplays
+        lock.unlock()
+        let displayMapping: [String: Int] = displaysSnapshot.isEmpty
+            ? [:]
+            : matchAllDDCEndpoints(for: displaysSnapshot, endpoints: rawEndpoints)
+
+        return rawEndpoints.map { endpoint in
+            let matchedUUID = displayMapping.first(where: { $0.value == endpoint.index })?.key
+            let primaryKey = matchedUUID.map { "uuid:\($0)" } ?? endpoint.storageKey
+
             lock.lock()
-            let cachedVol = cachedDDCVolumes[endpoint.index]
-            let cachedBright = cachedDDCBrightness[endpoint.index]
-            let cachedMute = cachedDDCMuted[endpoint.index] ?? false
-            let caps = cachedCapabilities[endpoint.storageKey]
+            let cachedVol = cachedDDCVolumes[primaryKey] ?? cachedDDCVolumes[endpoint.storageKey]
+            let cachedBright = cachedDDCBrightness[primaryKey] ?? cachedDDCBrightness[endpoint.storageKey]
+            let cachedMute = cachedDDCMuted[primaryKey] ?? cachedDDCMuted[endpoint.storageKey] ?? false
+            let caps = cachedCapabilities[primaryKey]
+                ?? (!endpoint.storageKey.hasPrefix("port:") ? cachedCapabilities[endpoint.storageKey] : nil)
             lock.unlock()
+
             return DDCDisplayEndpoint(
                 index: endpoint.index,
                 name: endpoint.name,
@@ -507,36 +527,40 @@ public final class AudioManager: @unchecked Sendable {
 
     /// 探测并缓存某台外接屏的 MCCS Capabilities 与当前硬件亮度（建议在后台线程调用）
     @discardableResult
-    public func probeCapabilitiesAndBrightness(endpointIndex: Int, force: Bool = false) -> DDCCapabilities {
-        let endpoints = ddcBackend.listEndpoints()
-        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else {
+    public func probeCapabilitiesAndBrightness(
+        endpointIndex: Int,
+        displayUUID: String? = nil,
+        force: Bool = false
+    ) -> DDCCapabilities {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        guard ctx.endpoint != nil else {
             return .unreachable
         }
 
         lock.lock()
-        let existing = cachedCapabilities[endpoint.storageKey]
+        let existing = cachedCapabilities[ctx.primaryKey]
         lock.unlock()
 
         let caps: DDCCapabilities
         if !force, let existing {
             caps = existing
         } else {
-            caps = ddcBackend.probeCapabilities(endpointIndex: endpointIndex)
+            caps = ddcBackend.probeCapabilities(endpointIndex: ctx.resolvedIndex)
             lock.lock()
-            cachedCapabilities[endpoint.storageKey] = caps
+            cachedCapabilities[ctx.primaryKey] = caps
             lock.unlock()
         }
 
         if caps.isReachable && caps.supportsBrightness,
-           let brightness = ddcBackend.readBrightness(endpointIndex: endpointIndex) {
+           let brightness = ddcBackend.readBrightness(endpointIndex: ctx.resolvedIndex) {
             lock.lock()
-            cachedDDCBrightness[endpointIndex] = brightness
+            cachedDDCBrightness[ctx.primaryKey] = brightness
             lock.unlock()
         }
         if caps.isReachable && caps.supportsVolume,
-           let vol = ddcBackend.readVolume(endpointIndex: endpointIndex) {
+           let vol = ddcBackend.readVolume(endpointIndex: ctx.resolvedIndex) {
             lock.lock()
-            cachedDDCVolumes[endpointIndex] = vol
+            cachedDDCVolumes[ctx.primaryKey] = vol
             lock.unlock()
         }
 
@@ -544,15 +568,22 @@ public final class AudioManager: @unchecked Sendable {
     }
 
     public func cachedCapabilities(for endpoint: DDCDisplayEndpoint) -> DDCCapabilities? {
+        let ctx = resolveDisplayContext(endpointIndex: endpoint.index)
         lock.lock()
         defer { lock.unlock() }
+        for key in ctx.lookupKeys {
+            if let caps = cachedCapabilities[key] {
+                return caps
+            }
+        }
         return cachedCapabilities[endpoint.storageKey]
     }
 
-    public func readDDCBrightness(endpointIndex: Int) -> Int? {
-        if let val = ddcBackend.readBrightness(endpointIndex: endpointIndex) {
+    public func readDDCBrightness(endpointIndex: Int, displayUUID: String? = nil) -> Int? {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        if let val = ddcBackend.readBrightness(endpointIndex: ctx.resolvedIndex) {
             lock.lock()
-            cachedDDCBrightness[endpointIndex] = val
+            cachedDDCBrightness[ctx.primaryKey] = val
             lock.unlock()
             return val
         }
@@ -560,12 +591,13 @@ public final class AudioManager: @unchecked Sendable {
     }
 
     @discardableResult
-    public func setDDCBrightness(_ percent: Int, endpointIndex: Int) -> Bool {
+    public func setDDCBrightness(_ percent: Int, endpointIndex: Int, displayUUID: String? = nil) -> Bool {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
         let clamped = min(max(percent, 0), 100)
         lock.lock()
-        cachedDDCBrightness[endpointIndex] = clamped
+        cachedDDCBrightness[ctx.primaryKey] = clamped
         lock.unlock()
-        return ddcBackend.setBrightness(clamped, endpointIndex: endpointIndex)
+        return ddcBackend.setBrightness(clamped, endpointIndex: ctx.resolvedIndex)
     }
 
     @discardableResult
@@ -605,8 +637,11 @@ public final class AudioManager: @unchecked Sendable {
 
         // 2. 尝试匹配 DDC/CI 硬件音量（仅当端点可达且支持 VCP 0x62 时使用）
         if let endpoint = matchDDCEndpoint(for: active, allDevices: devices) {
+            let ctx = resolveDisplayContext(endpointIndex: endpoint.index)
             lock.lock()
-            let caps = cachedCapabilities[endpoint.storageKey]
+            let caps = ctx.lookupKeys.compactMap { cachedCapabilities[$0] }.first
+            let cachedVol = ctx.lookupKeys.compactMap { cachedDDCVolumes[$0] }.first
+            let muted = ctx.lookupKeys.compactMap { cachedDDCMuted[$0] }.first ?? false
             lock.unlock()
 
             let ddcVolumeAllowed: Bool
@@ -620,15 +655,16 @@ public final class AudioManager: @unchecked Sendable {
             if ddcVolumeAllowed {
                 softwareVolume.deactivate()
                 let level: Int
-                if let cached = cachedDDCVolumes[endpoint.index] {
-                    level = cached
+                if let cachedVol {
+                    level = cachedVol
                 } else if readHardwareDDC, let hw = ddcBackend.readVolume(endpointIndex: endpoint.index) {
-                    cachedDDCVolumes[endpoint.index] = hw
+                    lock.lock()
+                    cachedDDCVolumes[ctx.primaryKey] = hw
+                    lock.unlock()
                     level = hw
                 } else {
                     level = 50
                 }
-                let muted = cachedDDCMuted[endpoint.index] ?? false
                 return AudioVolumeSnapshot(
                     deviceID: active.id,
                     deviceName: endpoint.name,
@@ -768,42 +804,55 @@ public final class AudioManager: @unchecked Sendable {
     }
 
     @discardableResult
-    public func setDDCVolume(_ percent: Int, endpointIndex: Int) -> Bool {
+    public func setDDCVolume(_ percent: Int, endpointIndex: Int, displayUUID: String? = nil) -> Bool {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
         let clamped = min(max(percent, 0), 100)
-        let wasMuted = cachedDDCMuted[endpointIndex] ?? false
-        cachedDDCVolumes[endpointIndex] = clamped
-
+        lock.lock()
+        let wasMuted = cachedDDCMuted[ctx.primaryKey] ?? false
+        cachedDDCVolumes[ctx.primaryKey] = clamped
         if clamped > 0 {
-            preMuteDDCVolumes[endpointIndex] = clamped
-            cachedDDCMuted[endpointIndex] = false
-            if wasMuted {
-                // 清理可能残留的硬件静音状态（VCP 0x8D = 2）
-                _ = ddcBackend.setMuted(false, endpointIndex: endpointIndex)
-            }
+            preMuteDDCVolumes[ctx.primaryKey] = clamped
+            cachedDDCMuted[ctx.primaryKey] = false
         }
-        return ddcBackend.setVolume(clamped, endpointIndex: endpointIndex)
+        lock.unlock()
+
+        if clamped > 0 && wasMuted {
+            // 清理可能残留的硬件静音状态（VCP 0x8D = 2）
+            _ = ddcBackend.setMuted(false, endpointIndex: ctx.resolvedIndex)
+        }
+        return ddcBackend.setVolume(clamped, endpointIndex: ctx.resolvedIndex)
     }
 
     @discardableResult
-    public func setDDCMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
-        cachedDDCMuted[endpointIndex] = muted
+    public func setDDCMuted(_ muted: Bool, endpointIndex: Int, displayUUID: String? = nil) -> Bool {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        lock.lock()
+        cachedDDCMuted[ctx.primaryKey] = muted
+        let currentCached = cachedDDCVolumes[ctx.primaryKey]
+        let savedPreMute = preMuteDDCVolumes[ctx.primaryKey]
+        lock.unlock()
+
         if muted {
             // 记录静音前的非零音量；通过将 VCP 0x62 设为 0 实现 100% 可逆静音，避免 LG 等显示器收到 0x8D=1 后无法软件解除静音
-            let current = cachedDDCVolumes[endpointIndex]
-                ?? ddcBackend.readVolume(endpointIndex: endpointIndex)
+            let current = currentCached
+                ?? ddcBackend.readVolume(endpointIndex: ctx.resolvedIndex)
                 ?? 50
+            lock.lock()
             if current > 0 {
-                preMuteDDCVolumes[endpointIndex] = current
+                preMuteDDCVolumes[ctx.primaryKey] = current
             }
-            cachedDDCVolumes[endpointIndex] = 0
-            return ddcBackend.setVolume(0, endpointIndex: endpointIndex)
+            cachedDDCVolumes[ctx.primaryKey] = 0
+            lock.unlock()
+            return ddcBackend.setVolume(0, endpointIndex: ctx.resolvedIndex)
         } else {
             // 先补发一次 VCP 0x8D = 2 尝试清理可能已存在的硬件静音锁，再通过 VCP 0x62 恢复静音前音量
-            _ = ddcBackend.setMuted(false, endpointIndex: endpointIndex)
-            let cached = cachedDDCVolumes[endpointIndex] ?? 0
-            let restoreVolume = preMuteDDCVolumes[endpointIndex] ?? (cached > 0 ? cached : 50)
-            cachedDDCVolumes[endpointIndex] = restoreVolume
-            return ddcBackend.setVolume(restoreVolume, endpointIndex: endpointIndex)
+            _ = ddcBackend.setMuted(false, endpointIndex: ctx.resolvedIndex)
+            let cached = currentCached ?? 0
+            let restoreVolume = savedPreMute ?? (cached > 0 ? cached : 50)
+            lock.lock()
+            cachedDDCVolumes[ctx.primaryKey] = restoreVolume
+            lock.unlock()
+            return ddcBackend.setVolume(restoreVolume, endpointIndex: ctx.resolvedIndex)
         }
     }
 
@@ -811,81 +860,141 @@ public final class AudioManager: @unchecked Sendable {
     public func setDisplayInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
-        protocolMode: InputSourceProtocolMode = .auto
+        protocolMode: InputSourceProtocolMode = .auto,
+        displayUUID: String? = nil
     ) -> Bool {
-        if let code = calibratedCode(for: source, endpointIndex: endpointIndex) {
-            return ddcBackend.writeRawInputCode(code, endpointIndex: endpointIndex)
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        if let code = calibratedCode(for: source, lookupKeys: ctx.lookupKeys) {
+            return ddcBackend.writeRawInputCode(code, endpointIndex: ctx.resolvedIndex)
         }
-        return ddcBackend.setInputSource(source, endpointIndex: endpointIndex, protocolMode: protocolMode)
+        let effectiveProtocol = resolvedProtocolOverride(forLookupKeys: ctx.lookupKeys) ?? protocolMode
+        return ddcBackend.setInputSource(
+            source,
+            endpointIndex: ctx.resolvedIndex,
+            protocolMode: effectiveProtocol,
+            hint: ctx.hint
+        )
     }
 
-    public func readDisplayInputStatus(endpointIndex: Int) -> DisplayInputStatus {
-        let raw = ddcBackend.readInputSource(endpointIndex: endpointIndex)
-        let calibrated = calibratedCodesMap(forEndpointIndex: endpointIndex)
+    public func readDisplayInputStatus(endpointIndex: Int, displayUUID: String? = nil) -> DisplayInputStatus {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        let raw = ddcBackend.readInputSource(endpointIndex: ctx.resolvedIndex, hint: ctx.hint)
+        let calibrated = calibratedCodesMap(forLookupKeys: ctx.lookupKeys)
         let active = DisplayInputSource.resolve(from: raw, calibrated: calibrated)
         let status = DisplayInputStatus(activeSource: active, rawRead: raw, calibratedCodes: calibrated)
         lock.lock()
-        cachedInputStatuses[endpointIndex] = status
+        cachedInputStatuses[ctx.primaryKey] = status
         lock.unlock()
         return status
     }
 
-    public func cachedDisplayInputStatus(endpointIndex: Int) -> DisplayInputStatus? {
+    public func cachedDisplayInputStatus(endpointIndex: Int, displayUUID: String? = nil) -> DisplayInputStatus? {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
         lock.lock()
         defer { lock.unlock() }
-        return cachedInputStatuses[endpointIndex]
+        for key in ctx.lookupKeys {
+            if let status = cachedInputStatuses[key] {
+                return status
+            }
+        }
+        return nil
     }
 
     /// 读取当前亮屏端口的真实硬件 VCP 码，并永久校准绑定到指定输入源（解决不同型号 USB-C 编码差异）
     @discardableResult
     public func calibrateCurrentInputSource(
         as source: DisplayInputSource,
-        endpointIndex: Int
+        endpointIndex: Int,
+        displayUUID: String? = nil
     ) -> DDCInputCode? {
-        let endpoints = ddcBackend.listEndpoints()
-        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        guard ctx.endpoint != nil else {
             return nil
         }
-        let read = ddcBackend.readInputSource(endpointIndex: endpointIndex)
+        let read = ddcBackend.readInputSource(endpointIndex: ctx.resolvedIndex, hint: ctx.hint)
         guard let code = read.preferredCode else {
             return nil
         }
 
+        saveCalibratedInputCode(code, for: source, primaryKey: ctx.primaryKey, lookupKeys: ctx.lookupKeys, rawRead: read)
+        return code
+    }
+
+    /// 手动为指定输入源绑定精确硬件 DDC 编码（适用于 0xF4 只写不回读的 LG 显示器），传 nil 可单独清除该端口绑定
+    public func setManualInputCode(
+        _ code: DDCInputCode?,
+        for source: DisplayInputSource,
+        endpointIndex: Int,
+        displayUUID: String? = nil
+    ) {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
         lock.lock()
-        var map = calibratedInputCodes[endpoint.storageKey] ?? [:]
-        map[source.rawValue] = code
-        calibratedInputCodes[endpoint.storageKey] = map
+        var map = calibratedInputCodes[ctx.primaryKey] ?? [:]
+        if let code {
+            map[source.rawValue] = code
+        } else {
+            map.removeValue(forKey: source.rawValue)
+        }
+        if map.isEmpty {
+            calibratedInputCodes.removeValue(forKey: ctx.primaryKey)
+        } else {
+            calibratedInputCodes[ctx.primaryKey] = map
+        }
         let snapshotToSave = calibratedInputCodes
+        let existingStatus = cachedInputStatuses[ctx.primaryKey]
         lock.unlock()
 
         var state = store.loadState()
         state.calibratedInputCodes = snapshotToSave
         store.saveState(state)
 
-        // 更新缓存状态使高亮立刻生效
-        let updated = DisplayInputStatus(
-            activeSource: source,
-            rawRead: read,
-            calibratedCodes: calibratedCodesMap(forStorageKey: endpoint.storageKey)
-        )
+        let updatedCodes = calibratedCodesMap(forLookupKeys: ctx.lookupKeys)
+        let rawRead = existingStatus?.rawRead ?? DDCInputReadResult()
+        let resolvedActive = DisplayInputSource.resolve(from: rawRead, calibrated: updatedCodes) ?? existingStatus?.activeSource
+        let updated = DisplayInputStatus(activeSource: resolvedActive, rawRead: rawRead, calibratedCodes: updatedCodes)
         lock.lock()
-        cachedInputStatuses[endpointIndex] = updated
+        cachedInputStatuses[ctx.primaryKey] = updated
         lock.unlock()
-        return code
     }
 
-    public func resetInputCalibration(endpointIndex: Int) {
-        let endpoints = ddcBackend.listEndpoints()
-        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return }
+    public func resetInputCalibration(endpointIndex: Int, displayUUID: String? = nil) {
+        let ctx = resolveDisplayContext(endpointIndex: endpointIndex, displayUUID: displayUUID)
 
         lock.lock()
-        calibratedInputCodes.removeValue(forKey: endpoint.storageKey)
+        for key in ctx.lookupKeys {
+            calibratedInputCodes.removeValue(forKey: key)
+            cachedInputStatuses.removeValue(forKey: key)
+        }
         let snapshotToSave = calibratedInputCodes
-        cachedInputStatuses.removeValue(forKey: endpointIndex)
         lock.unlock()
 
         var state = store.loadState()
         state.calibratedInputCodes = snapshotToSave
+        store.saveState(state)
+    }
+
+    /// 读取单台显示器的输入源协议覆盖设置（nil 表示跟随全局默认协议）
+    public func displayInputProtocol(forDisplayUUID uuid: String) -> InputSourceProtocolMode? {
+        lock.lock()
+        defer { lock.unlock() }
+        return displayInputProtocols["uuid:\(uuid)"] ?? displayInputProtocols[uuid]
+    }
+
+    /// 设置或清除（传 nil）单台显示器的专属输入源协议模式（例如：左屏标准 0x60、右屏强制 LG 0xF4）
+    public func setDisplayInputProtocol(_ mode: InputSourceProtocolMode?, forDisplayUUID uuid: String) {
+        let key = "uuid:\(uuid)"
+        lock.lock()
+        displayInputProtocols.removeValue(forKey: uuid)
+        if let mode {
+            displayInputProtocols[key] = mode
+        } else {
+            displayInputProtocols.removeValue(forKey: key)
+        }
+        let snapshotToSave = displayInputProtocols
+        lock.unlock()
+
+        var state = store.loadState()
+        state.displayInputProtocols = snapshotToSave
         store.saveState(state)
     }
 
@@ -953,9 +1062,10 @@ public final class AudioManager: @unchecked Sendable {
         let savedBindings = preferredDDCKeyByDisplayUUID
         lock.unlock()
 
-        // 第 1 轮：持久化手动绑定
+        // 第 1 轮：跨插拔稳定的持久化手动绑定（如基于唯一序列号 serial:... 的纠偏；易随插线顺序改变的 port:dispextN 不抢占物理管线）
         for display in enabledExternals {
             if let targetKey = savedBindings[display.uuid],
+               !targetKey.hasPrefix("port:"),
                let ep = eps.first(where: { !usedEndpoints.contains($0.index) && $0.storageKey == targetKey }) {
                 result[display.uuid] = ep.index
                 usedEndpoints.insert(ep.index)
@@ -990,6 +1100,15 @@ public final class AudioManager: @unchecked Sendable {
                    }
                    return epSerial == serial || epSerial.contains(serial) || serial.contains(epSerial)
                }) {
+                result[display.uuid] = ep.index
+                usedEndpoints.insert(ep.index)
+            }
+        }
+
+        // 第 4.5 轮：无物理管线与序列号时的端口手动绑定兜底
+        for display in enabledExternals where result[display.uuid] == nil {
+            if let targetKey = savedBindings[display.uuid],
+               let ep = eps.first(where: { !usedEndpoints.contains($0.index) && $0.storageKey == targetKey }) {
                 result[display.uuid] = ep.index
                 usedEndpoints.insert(ep.index)
             }
@@ -1179,26 +1298,159 @@ public final class AudioManager: @unchecked Sendable {
         return String(text[range])
     }
 
-    private func calibratedCode(for source: DisplayInputSource, endpointIndex: Int) -> DDCInputCode? {
-        let endpoints = ddcBackend.listEndpoints()
-        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return nil }
+    private struct ResolvedDisplayDDCContext {
+        let endpoint: DDCDisplayEndpoint?
+        let resolvedIndex: Int
+        let display: DisplayInfo?
+        let primaryKey: String
+        let lookupKeys: [String]
+        let hint: DDCDisplayHint
+    }
+
+    private func resolveDisplayContext(
+        endpointIndex: Int,
+        displayUUID: String? = nil,
+        endpoints: [DDCDisplayEndpoint]? = nil
+    ) -> ResolvedDisplayDDCContext {
+        let eps = endpoints ?? ddcBackend.listEndpoints()
+        lock.lock()
+        let displaysSnapshot = knownDisplays
+        lock.unlock()
+
+        let displayMapping: [String: Int] = displaysSnapshot.isEmpty
+            ? [:]
+            : matchAllDDCEndpoints(for: displaysSnapshot, endpoints: eps)
+
+        let matchedDisplay: DisplayInfo?
+        let resolvedIndex: Int
+        if let uuid = displayUUID, !uuid.isEmpty {
+            matchedDisplay = displaysSnapshot.first(where: { $0.uuid == uuid })
+            resolvedIndex = displayMapping[uuid] ?? endpointIndex
+        } else {
+            resolvedIndex = endpointIndex
+            if let matchedUUID = displayMapping.first(where: { $0.value == endpointIndex })?.key {
+                matchedDisplay = displaysSnapshot.first(where: { $0.uuid == matchedUUID })
+            } else {
+                matchedDisplay = nil
+            }
+        }
+
+        let endpoint = eps.first(where: { $0.index == resolvedIndex })
+        let primaryKey: String
+        if let d = matchedDisplay {
+            primaryKey = "uuid:\(d.uuid)"
+        } else if let uuid = displayUUID, !uuid.isEmpty {
+            primaryKey = "uuid:\(uuid)"
+        } else if let ep = endpoint {
+            primaryKey = ep.storageKey
+        } else {
+            primaryKey = "endpoint:\(resolvedIndex)"
+        }
+
+        var lookupKeys = [primaryKey]
+        if let ep = endpoint, ep.storageKey != primaryKey, !ep.storageKey.hasPrefix("port:") {
+            lookupKeys.append(ep.storageKey)
+        }
+
+        lock.lock()
+        let knownCaps = lookupKeys.compactMap { cachedCapabilities[$0] }.first
+        lock.unlock()
+
+        let hint = matchedDisplay.map { DDCDisplayHint(display: $0, capabilities: knownCaps) }
+            ?? DDCDisplayHint(capabilities: knownCaps)
+        return ResolvedDisplayDDCContext(
+            endpoint: endpoint,
+            resolvedIndex: resolvedIndex,
+            display: matchedDisplay,
+            primaryKey: primaryKey,
+            lookupKeys: lookupKeys,
+            hint: hint
+        )
+    }
+
+    /// 一键清空所有历史手动 DDC 通道绑定、端口校准与单屏协议覆盖，恢复纯粹硬件自动匹配
+    public func resetAllDDCCustomizations() {
+        lock.lock()
+        preferredDDCEndpointByAudioUID.removeAll()
+        preferredDDCKeyByDisplayUUID.removeAll()
+        calibratedInputCodes.removeAll()
+        displayInputProtocols.removeAll()
+        cachedInputStatuses.removeAll()
+        lock.unlock()
+
+        var state = store.loadState()
+        state.audioToDDCBindings = [:]
+        state.displayToDDCBindings = [:]
+        state.calibratedInputCodes = [:]
+        state.displayInputProtocols = [:]
+        store.saveState(state)
+    }
+
+    private func saveCalibratedInputCode(
+        _ code: DDCInputCode,
+        for source: DisplayInputSource,
+        primaryKey: String,
+        lookupKeys: [String],
+        rawRead: DDCInputReadResult
+    ) {
+        lock.lock()
+        var map = calibratedInputCodes[primaryKey] ?? [:]
+        map[source.rawValue] = code
+        calibratedInputCodes[primaryKey] = map
+        let snapshotToSave = calibratedInputCodes
+        lock.unlock()
+
+        var state = store.loadState()
+        state.calibratedInputCodes = snapshotToSave
+        store.saveState(state)
+
+        let updated = DisplayInputStatus(
+            activeSource: source,
+            rawRead: rawRead,
+            calibratedCodes: calibratedCodesMap(forLookupKeys: lookupKeys)
+        )
+        lock.lock()
+        cachedInputStatuses[primaryKey] = updated
+        lock.unlock()
+    }
+
+    private func resolvedProtocolOverride(forLookupKeys keys: [String]) -> InputSourceProtocolMode? {
         lock.lock()
         defer { lock.unlock() }
-        return calibratedInputCodes[endpoint.storageKey]?[source.rawValue]
+        for key in keys {
+            if let mode = displayInputProtocols[key] {
+                return mode
+            }
+        }
+        return nil
     }
 
-    private func calibratedCodesMap(forEndpointIndex endpointIndex: Int) -> [DisplayInputSource: DDCInputCode] {
-        let endpoints = ddcBackend.listEndpoints()
-        guard let endpoint = endpoints.first(where: { $0.index == endpointIndex }) else { return [:] }
-        return calibratedCodesMap(forStorageKey: endpoint.storageKey)
-    }
-
-    private func calibratedCodesMap(forStorageKey key: String) -> [DisplayInputSource: DDCInputCode] {
+    private func calibratedCode(for source: DisplayInputSource, lookupKeys: [String]) -> DDCInputCode? {
         lock.lock()
-        let rawMap = calibratedInputCodes[key] ?? [:]
+        defer { lock.unlock() }
+        for key in lookupKeys {
+            if let code = calibratedInputCodes[key]?[source.rawValue] {
+                return code
+            }
+        }
+        return nil
+    }
+
+    private func calibratedCodesMap(forLookupKeys keys: [String]) -> [DisplayInputSource: DDCInputCode] {
+        lock.lock()
+        var merged: [String: DDCInputCode] = [:]
+        // 低优先级 key 先写入，primaryKey 最后覆盖
+        for key in keys.reversed() {
+            if let rawMap = calibratedInputCodes[key] {
+                for (k, v) in rawMap {
+                    merged[k] = v
+                }
+            }
+        }
         lock.unlock()
+
         var result: [DisplayInputSource: DDCInputCode] = [:]
-        for (rawKey, code) in rawMap {
+        for (rawKey, code) in merged {
             if let source = DisplayInputSource(rawValue: rawKey) {
                 result[source] = code
             }

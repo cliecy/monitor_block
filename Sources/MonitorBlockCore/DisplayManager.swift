@@ -38,7 +38,8 @@ public final class DisplayManager {
             customNames: customNames,
             audioToDDCBindings: existing.audioToDDCBindings,
             displayToDDCBindings: existing.displayToDDCBindings,
-            calibratedInputCodes: existing.calibratedInputCodes
+            calibratedInputCodes: existing.calibratedInputCodes,
+            displayInputProtocols: existing.displayInputProtocols
         )
         store.saveState(state)
     }

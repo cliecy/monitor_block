@@ -76,15 +76,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         updateStatusIcon()
 
+        // 启动后后台静默探测一次外接屏硬件能力与输入源，无需等首次点开菜单栏才识别
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.appViewModel.probeDDCStateAsync()
+        }
+
         displayManager.startObservingReconfiguration { [weak self] in
             Task { @MainActor in
-                self?.scheduleRefresh(checkSafetyFallback: true)
+                self?.scheduleRefresh(delay: 0.55, checkSafetyFallback: true, reprobeDDC: true)
             }
         }
 
         audioManager.startObservingChanges { [weak self] in
             Task { @MainActor in
-                self?.scheduleRefresh(delay: 0.15, checkSafetyFallback: false)
+                self?.scheduleRefresh(delay: 0.15, checkSafetyFallback: false, reprobeDDC: false)
             }
         }
 
@@ -94,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.scheduleRefresh(delay: 0.6, checkSafetyFallback: true)
+                self?.scheduleRefresh(delay: 0.75, checkSafetyFallback: true, reprobeDDC: true)
             }
         }
     }
@@ -133,17 +138,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: - Refresh
 
-    private func scheduleRefresh(delay: TimeInterval = 0.25, checkSafetyFallback: Bool = false) {
+    private func scheduleRefresh(
+        delay: TimeInterval = 0.25,
+        checkSafetyFallback: Bool = false,
+        reprobeDDC: Bool = false
+    ) {
         pendingRefreshWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if checkSafetyFallback {
                 self.displayManager.ensureBuiltinActiveIfNoExternalActive()
             }
+            let latestDisplays = self.displayManager.listDisplays(includeBuiltin: true)
+            self.audioManager.updateKnownDisplays(latestDisplays)
             self.updateStatusIcon()
+
             let isMainWindowVisible = self.mainWindowController?.window?.isVisible ?? false
-            if self.popover.isShown || isMainWindowVisible {
-                self.appViewModel.refresh(readHardwareDDC: false, autoRestoreValue: self.autoRestoreOnQuit)
+            if self.popover.isShown || isMainWindowVisible || reprobeDDC {
+                self.appViewModel.refresh(readHardwareDDC: reprobeDDC, autoRestoreValue: self.autoRestoreOnQuit)
             } else {
                 // 即使面板未打开，系统默认输出设备切换时也需立刻释放不再适用的软件音量代理
                 _ = self.audioManager.currentVolumeSnapshot(readHardwareDDC: false, activateSoftwareVolumeIfNeeded: false)

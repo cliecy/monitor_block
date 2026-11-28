@@ -53,6 +53,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
     public var audioToDDCBindings: [String: Int]
     public var displayToDDCBindings: [String: String]
     public var calibratedInputCodes: [String: [String: DDCInputCode]]
+    public var displayInputProtocols: [String: InputSourceProtocolMode]
 
     public init(
         cachedDisplays: [CachedDisplayRecord] = [],
@@ -62,7 +63,8 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         customNames: [String: String] = [:],
         audioToDDCBindings: [String: Int] = [:],
         displayToDDCBindings: [String: String] = [:],
-        calibratedInputCodes: [String: [String: DDCInputCode]] = [:]
+        calibratedInputCodes: [String: [String: DDCInputCode]] = [:],
+        displayInputProtocols: [String: InputSourceProtocolMode] = [:]
     ) {
         self.cachedDisplays = cachedDisplays
         self.presets = presets
@@ -72,6 +74,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.audioToDDCBindings = audioToDDCBindings
         self.displayToDDCBindings = displayToDDCBindings
         self.calibratedInputCodes = calibratedInputCodes
+        self.displayInputProtocols = displayInputProtocols
     }
 
     enum CodingKeys: String, CodingKey {
@@ -83,6 +86,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         case audioToDDCBindings
         case displayToDDCBindings
         case calibratedInputCodes
+        case displayInputProtocols
     }
 
     public init(from decoder: Decoder) throws {
@@ -95,6 +99,7 @@ public struct PersistedAppState: Codable, Equatable, Sendable {
         self.audioToDDCBindings = try container.decodeIfPresent([String: Int].self, forKey: .audioToDDCBindings) ?? [:]
         self.displayToDDCBindings = try container.decodeIfPresent([String: String].self, forKey: .displayToDDCBindings) ?? [:]
         self.calibratedInputCodes = try container.decodeIfPresent([String: [String: DDCInputCode]].self, forKey: .calibratedInputCodes) ?? [:]
+        self.displayInputProtocols = try container.decodeIfPresent([String: InputSourceProtocolMode].self, forKey: .displayInputProtocols) ?? [:]
     }
 }
 

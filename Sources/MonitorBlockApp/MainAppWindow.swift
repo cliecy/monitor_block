@@ -705,26 +705,23 @@ struct MainAppRootView: View {
 
             SurfaceCard {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("DDC/CI 视频输入源默认协议")
+                    Text("智能 DDC/CI 跨场景硬件自适应")
                         .font(.system(size: 13.5, weight: .semibold))
-                    Text("默认「自动」会自动兼容标准 MCCS (0x60) 与 LG 专有通道 (0x50/0xF4)。如遇特殊型号可手动切换，或直接在显示器卡片中点击 ⚙︎ 校准具体端口。")
+                    Text("自动根据每台显示器的 EDID 厂商码与 MCCS 0xF3 硬件能力选择协议：DELL 等标准显示器精准直发 0x60 硬件端口码，LG 显示器自动走 0x50/0xF4 专有通道；热插拔或睡眠唤醒后自动重新探测，在不同场所（如实验室 DELL ↔ 家里双 LG）切换无需手动改设置。")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
-                    Picker(
-                        "协议模式",
-                        selection: Binding(
-                            get: { viewModel.inputProtocolMode },
-                            set: { viewModel.setInputProtocolMode($0) }
-                        )
-                    ) {
-                        ForEach(InputSourceProtocolMode.allCases) { mode in
-                            Text(mode.label).tag(mode)
+                    HStack {
+                        Button("重置全部 DDC 手动绑定与端口校准") {
+                            viewModel.resetAllDDCCustomizations()
                         }
+                        .controlSize(.small)
+
+                        Text("如曾手动改绑过通道或协议，可一键恢复纯自动硬件匹配（特殊机型也可在显示器卡片 ⚙︎ 中按屏单独设定）。")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Spacer()
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: 420)
                 }
             }
 

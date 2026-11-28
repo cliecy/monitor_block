@@ -63,6 +63,7 @@ final class AppViewModel: ObservableObject {
     @Published var inputStatuses: [Int: DisplayInputStatus] = [:]
     @Published var switchingInputs: [Int: DisplayInputSource] = [:]
     @Published var inputProtocolMode: InputSourceProtocolMode = .auto
+    @Published var displayInputProtocols: [String: InputSourceProtocolMode] = [:]
 
     // Audio State
     @Published var audioDevices: [AudioOutputDevice] = []
@@ -124,10 +125,10 @@ final class AppViewModel: ObservableObject {
         self.onQuit = onQuit
         self.onStatusChanged = onStatusChanged
 
-        if let raw = UserDefaults.standard.string(forKey: Self.inputProtocolKey),
-           let saved = InputSourceProtocolMode(rawValue: raw) {
-            self.inputProtocolMode = saved
-        }
+        // 全局协议始终保持 .auto（按每台显示器的 EDID 厂商与 MCCS 0xF3 硬件能力自动分流，避免实验室 DELL 与家里 LG 互相污染）；
+        // 清理旧版本可能残留的全局协议覆盖，个别显示器若需固定协议均按 UUID 独立存储在 displayInputProtocols 中。
+        self.inputProtocolMode = .auto
+        UserDefaults.standard.removeObject(forKey: Self.inputProtocolKey)
         let softVolEnabled: Bool
         if UserDefaults.standard.object(forKey: Self.softwareVolumeKey) == nil {
             softVolEnabled = true
@@ -203,25 +204,46 @@ final class AppViewModel: ObservableObject {
         volumeTargetName = snapshot.deviceName
         softwareVolumeError = audioManager.softwareVolumeLastError
 
-        for ep in ddcEndpoints {
-            if let caps = ep.capabilities {
-                ddcCapabilities[ep.index] = caps
-            }
-            if let bright = ep.currentBrightness {
-                ddcBrightness[ep.index] = Double(bright) / 100.0
-            } else if ddcBrightness[ep.index] == nil {
-                ddcBrightness[ep.index] = 0.5
-            }
-            if let vol = ep.currentVolume {
-                ddcVolumes[ep.index] = Double(vol) / 100.0
-            } else if ddcVolumes[ep.index] == nil {
-                ddcVolumes[ep.index] = 0.5
-            }
-            ddcMuted[ep.index] = ep.isMuted
-            if let cachedStatus = audioManager.cachedDisplayInputStatus(endpointIndex: ep.index) {
-                inputStatuses[ep.index] = cachedStatus
+        var perDisplayProtocols: [String: InputSourceProtocolMode] = [:]
+        for display in displays where !display.isBuiltin {
+            if let overrideMode = audioManager.displayInputProtocol(forDisplayUUID: display.uuid) {
+                perDisplayProtocols[display.uuid] = overrideMode
             }
         }
+        displayInputProtocols = perDisplayProtocols
+
+        var nextCapabilities: [Int: DDCCapabilities] = [:]
+        var nextBrightness: [Int: Double] = [:]
+        var nextVolumes: [Int: Double] = [:]
+        var nextMuted: [Int: Bool] = [:]
+        var nextInputStatuses: [Int: DisplayInputStatus] = [:]
+
+        for ep in ddcEndpoints {
+            let matchedUUID = displayMapping.first(where: { $0.value == ep.index })?.key
+            if let caps = ep.capabilities {
+                nextCapabilities[ep.index] = caps
+            }
+            if let bright = ep.currentBrightness {
+                nextBrightness[ep.index] = Double(bright) / 100.0
+            } else {
+                nextBrightness[ep.index] = ddcBrightness[ep.index] ?? 0.5
+            }
+            if let vol = ep.currentVolume {
+                nextVolumes[ep.index] = Double(vol) / 100.0
+            } else {
+                nextVolumes[ep.index] = ddcVolumes[ep.index] ?? 0.5
+            }
+            nextMuted[ep.index] = ep.isMuted
+            if let cachedStatus = audioManager.cachedDisplayInputStatus(endpointIndex: ep.index, displayUUID: matchedUUID) {
+                nextInputStatuses[ep.index] = cachedStatus
+            }
+        }
+
+        ddcCapabilities = nextCapabilities
+        ddcBrightness = nextBrightness
+        ddcVolumes = nextVolumes
+        ddcMuted = nextMuted
+        inputStatuses = nextInputStatuses
 
         if readHardwareDDC {
             probeDDCStateAsync()
@@ -229,18 +251,28 @@ final class AppViewModel: ObservableObject {
     }
 
     func probeDDCStateAsync(forceCapabilities: Bool = false) {
-        let indices = ddcEndpoints.map(\.index)
-        guard !indices.isEmpty else { return }
+        let targets: [(index: Int, uuid: String?)] = ddcEndpoints.map { ep in
+            let uuid = displayToDDCIndex.first(where: { $0.value == ep.index })?.key
+            return (ep.index, uuid)
+        }
+        guard !targets.isEmpty else { return }
         let audioMgr = audioManager
 
         Task.detached(priority: .userInitiated) {
             var capsMap: [Int: DDCCapabilities] = [:]
             var inputMap: [Int: DisplayInputStatus] = [:]
-            for idx in indices {
-                let caps = audioMgr.probeCapabilitiesAndBrightness(endpointIndex: idx, force: forceCapabilities)
-                capsMap[idx] = caps
+            for item in targets {
+                let caps = audioMgr.probeCapabilitiesAndBrightness(
+                    endpointIndex: item.index,
+                    displayUUID: item.uuid,
+                    force: forceCapabilities
+                )
+                capsMap[item.index] = caps
                 if caps.isReachable {
-                    inputMap[idx] = audioMgr.readDisplayInputStatus(endpointIndex: idx)
+                    inputMap[item.index] = audioMgr.readDisplayInputStatus(
+                        endpointIndex: item.index,
+                        displayUUID: item.uuid
+                    )
                 }
             }
             let updatedEndpoints = audioMgr.listDDCEndpoints()
@@ -263,7 +295,15 @@ final class AppViewModel: ObservableObject {
                     }
                 }
                 for (idx, status) in finalInputs {
-                    self.inputStatuses[idx] = status
+                    if status.activeSource == nil, let prevActive = self.inputStatuses[idx]?.activeSource {
+                        self.inputStatuses[idx] = DisplayInputStatus(
+                            activeSource: prevActive,
+                            rawRead: status.rawRead,
+                            calibratedCodes: status.calibratedCodes
+                        )
+                    } else {
+                        self.inputStatuses[idx] = status
+                    }
                 }
                 self.volume = updatedSnapshot.volume
                 self.isMuted = updatedSnapshot.isMuted
@@ -278,12 +318,22 @@ final class AppViewModel: ObservableObject {
         probeDDCStateAsync(forceCapabilities: false)
     }
 
-    func refreshSingleInputStatusAsync(endpointIndex: Int) {
+    func refreshSingleInputStatusAsync(endpointIndex: Int, displayUUID: String? = nil) {
         let audioMgr = audioManager
         Task.detached(priority: .userInitiated) {
-            let status = audioMgr.readDisplayInputStatus(endpointIndex: endpointIndex)
+            let status = audioMgr.readDisplayInputStatus(endpointIndex: endpointIndex, displayUUID: displayUUID)
             await MainActor.run { [weak self] in
-                self?.inputStatuses[endpointIndex] = status
+                guard let self else { return }
+                let targetIdx = displayUUID.flatMap { self.displayToDDCIndex[$0] } ?? endpointIndex
+                if status.activeSource == nil, let prevActive = self.inputStatuses[targetIdx]?.activeSource {
+                    self.inputStatuses[targetIdx] = DisplayInputStatus(
+                        activeSource: prevActive,
+                        rawRead: status.rawRead,
+                        calibratedCodes: status.calibratedCodes
+                    )
+                } else {
+                    self.inputStatuses[targetIdx] = status
+                }
             }
         }
     }
@@ -648,73 +698,148 @@ final class AppViewModel: ObservableObject {
     func setInputProtocolMode(_ mode: InputSourceProtocolMode) {
         inputProtocolMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Self.inputProtocolKey)
-        showBanner("输入源协议已切换为：\(mode.label)", isError: false)
+        showBanner("全局默认输入源协议已切换为：\(mode.label)", isError: false)
     }
 
-    func switchInputSource(_ source: DisplayInputSource, endpointIndex: Int, displayName: String) {
-        switchingInputs[endpointIndex] = source
+    func setDisplayInputProtocol(_ mode: InputSourceProtocolMode?, for displayUUID: String, displayName: String) {
+        audioManager.setDisplayInputProtocol(mode, forDisplayUUID: displayUUID)
+        if let mode {
+            displayInputProtocols[displayUUID] = mode
+            showBanner("已将「\(displayName)」的输入源协议设为：\(mode.label)", isError: false)
+        } else {
+            displayInputProtocols.removeValue(forKey: displayUUID)
+            showBanner("「\(displayName)」已恢复跟随全局默认协议（\(inputProtocolMode.label)）", isError: false)
+        }
+    }
+
+    func switchInputSource(
+        _ source: DisplayInputSource,
+        displayUUID: String,
+        endpointIndex: Int,
+        displayName: String
+    ) {
+        // 先同步最新在线屏幕拓扑，防止其他屏幕刚切走后 dispextN 索引发生偏移
+        let latestDisplays = displayManager.listDisplays(includeBuiltin: true)
+        audioManager.updateKnownDisplays(latestDisplays)
+        let liveMapping = audioManager.matchAllDDCEndpoints(for: latestDisplays)
+        let resolvedIndex = liveMapping[displayUUID] ?? endpointIndex
+        displayToDDCIndex = liveMapping
+
+        switchingInputs[resolvedIndex] = source
         showBanner("正在将「\(displayName)」切换至 \(source.label)…", isError: false, autoClear: false)
 
         let audioMgr = audioManager
         let mode = inputProtocolMode
 
         Task.detached(priority: .userInitiated) {
-            let ok = audioMgr.setDisplayInputSource(source, endpointIndex: endpointIndex, protocolMode: mode)
+            let ok = audioMgr.setDisplayInputSource(
+                source,
+                endpointIndex: resolvedIndex,
+                protocolMode: mode,
+                displayUUID: displayUUID
+            )
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.switchingInputs.removeValue(forKey: endpointIndex)
+                self.switchingInputs.removeValue(forKey: resolvedIndex)
                 if ok {
-                    let existing = self.inputStatuses[endpointIndex]
-                    self.inputStatuses[endpointIndex] = DisplayInputStatus(
+                    let existing = self.inputStatuses[resolvedIndex]
+                    self.inputStatuses[resolvedIndex] = DisplayInputStatus(
                         activeSource: source,
                         rawRead: existing?.rawRead ?? DDCInputReadResult(),
                         calibratedCodes: existing?.calibratedCodes ?? [:]
                     )
                     self.showBanner("已发送信号源切换：\(displayName) → \(source.label)", isError: false)
                 } else {
-                    self.showBanner("「\(displayName)」切换至 \(source.label) 失败，可点击 ⚙︎ 校准该端口。", isError: true)
+                    self.showBanner("「\(displayName)」切换至 \(source.label) 失败，可点击 ⚙︎ 调整协议或端口编码。", isError: true)
                 }
             }
 
+            guard ok else { return }
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            let updatedStatus = audioMgr.readDisplayInputStatus(endpointIndex: endpointIndex)
+            let updatedStatus = audioMgr.readDisplayInputStatus(endpointIndex: resolvedIndex, displayUUID: displayUUID)
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                if updatedStatus.activeSource != nil || !updatedStatus.rawRead.isEmpty {
-                    self.inputStatuses[endpointIndex] = updatedStatus
+                let currentIdx = self.displayToDDCIndex[displayUUID] ?? resolvedIndex
+                if updatedStatus.activeSource != nil {
+                    self.inputStatuses[currentIdx] = updatedStatus
+                } else {
+                    // 对 0xF4 只写不回读或 0x60 返回 0x00 的 LG 显示器，保留刚刚选中的端口高亮，仅更新底层 rawRead
+                    self.inputStatuses[currentIdx] = DisplayInputStatus(
+                        activeSource: source,
+                        rawRead: updatedStatus.rawRead,
+                        calibratedCodes: updatedStatus.calibratedCodes
+                    )
                 }
             }
         }
     }
 
-    func calibrateCurrentInput(as source: DisplayInputSource, endpointIndex: Int, displayName: String) {
+    func calibrateCurrentInput(
+        as source: DisplayInputSource,
+        displayUUID: String,
+        endpointIndex: Int,
+        displayName: String
+    ) {
         showBanner("正在读取「\(displayName)」当前端口硬件码…", isError: false, autoClear: false)
         let audioMgr = audioManager
 
         Task.detached(priority: .userInitiated) {
-            let code = audioMgr.calibrateCurrentInputSource(as: source, endpointIndex: endpointIndex)
-            let refreshed = audioMgr.cachedDisplayInputStatus(endpointIndex: endpointIndex)
+            let code = audioMgr.calibrateCurrentInputSource(
+                as: source,
+                endpointIndex: endpointIndex,
+                displayUUID: displayUUID
+            )
+            let refreshed = audioMgr.cachedDisplayInputStatus(endpointIndex: endpointIndex, displayUUID: displayUUID)
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                let targetIdx = self.displayToDDCIndex[displayUUID] ?? endpointIndex
                 if let refreshed {
-                    self.inputStatuses[endpointIndex] = refreshed
+                    self.inputStatuses[targetIdx] = refreshed
                 }
                 if let code {
                     self.showBanner("校准成功：「\(displayName)」的 \(source.label) 已绑定为 \(code.hexSummary)", isError: false)
                 } else {
-                    self.showBanner("未能从「\(displayName)」读出当前端口码，请确认线缆支持 DDC/CI。", isError: true)
+                    self.showBanner("此屏未公开当前端口回读码（如 LG 0xF4 只写固件），可在 ⚙︎ →「手动指定端口硬件码」中直接选择。", isError: true)
                 }
             }
         }
     }
 
-    func resetInputCalibration(endpointIndex: Int, displayName: String) {
-        audioManager.resetInputCalibration(endpointIndex: endpointIndex)
-        refreshSingleInputStatusAsync(endpointIndex: endpointIndex)
+    func setManualInputCode(
+        _ code: DDCInputCode?,
+        for source: DisplayInputSource,
+        displayUUID: String,
+        endpointIndex: Int,
+        displayName: String
+    ) {
+        audioManager.setManualInputCode(code, for: source, endpointIndex: endpointIndex, displayUUID: displayUUID)
+        let targetIdx = displayToDDCIndex[displayUUID] ?? endpointIndex
+        if let refreshed = audioManager.cachedDisplayInputStatus(endpointIndex: targetIdx, displayUUID: displayUUID) {
+            inputStatuses[targetIdx] = refreshed
+        }
+        if let code {
+            showBanner("已将「\(displayName)」的 \(source.label) 手动绑定为 \(code.hexSummary)", isError: false)
+        } else {
+            showBanner("已恢复「\(displayName)」的 \(source.label) 默认编码", isError: false)
+        }
+    }
+
+    func resetInputCalibration(displayUUID: String, endpointIndex: Int, displayName: String) {
+        audioManager.resetInputCalibration(endpointIndex: endpointIndex, displayUUID: displayUUID)
+        refreshSingleInputStatusAsync(endpointIndex: endpointIndex, displayUUID: displayUUID)
         showBanner("已重置「\(displayName)」的输入源校准", isError: false)
     }
 
-    func updateDDCBrightness(endpointIndex: Int, value: Double) {
+    func resetAllDDCCustomizations() {
+        audioManager.resetAllDDCCustomizations()
+        inputProtocolMode = .auto
+        UserDefaults.standard.removeObject(forKey: Self.inputProtocolKey)
+        displayInputProtocols.removeAll()
+        refresh(readHardwareDDC: true)
+        showBanner("已清除所有历史手动 DDC 绑定与校准，恢复纯自动硬件识别", isError: false)
+    }
+
+    func updateDDCBrightness(endpointIndex: Int, displayUUID: String? = nil, value: Double) {
         let clamped = min(max(value, 0.0), 1.0)
         ddcBrightness[endpointIndex] = clamped
 
@@ -723,7 +848,7 @@ final class AppViewModel: ObservableObject {
         let work = DispatchWorkItem {
             let percent = Int((clamped * 100.0).rounded())
             Task.detached(priority: .userInitiated) {
-                _ = audioMgr.setDDCBrightness(percent, endpointIndex: endpointIndex)
+                _ = audioMgr.setDDCBrightness(percent, endpointIndex: endpointIndex, displayUUID: displayUUID)
             }
         }
         pendingBrightnessWorkItems[endpointIndex] = work

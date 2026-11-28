@@ -113,7 +113,8 @@ private final class MockDDCBackend: DDCBackend {
     var setVolumeCalls: [(index: Int, volume: Int)] = []
     var setBrightnessCalls: [(index: Int, brightness: Int)] = []
     var setMuteCalls: [(index: Int, muted: Bool)] = []
-    var setInputCalls: [(index: Int, source: DisplayInputSource, mode: InputSourceProtocolMode)] = []
+    var setInputCalls: [(index: Int, source: DisplayInputSource, mode: InputSourceProtocolMode, hint: DDCDisplayHint)] = []
+    var readInputHints: [Int: DDCDisplayHint] = [:]
     var writeRawInputCalls: [(index: Int, code: DDCInputCode)] = []
     var probeCalls: [Int] = []
     var muteSupported: Bool = true
@@ -161,8 +162,9 @@ private final class MockDDCBackend: DDCBackend {
         return muteSupported
     }
 
-    func readInputSource(endpointIndex: Int) -> DDCInputReadResult {
-        hardwareInputs[endpointIndex] ?? DDCInputReadResult()
+    func readInputSource(endpointIndex: Int, hint: DDCDisplayHint) -> DDCInputReadResult {
+        readInputHints[endpointIndex] = hint
+        return hardwareInputs[endpointIndex] ?? DDCInputReadResult()
     }
 
     func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool {
@@ -173,9 +175,10 @@ private final class MockDDCBackend: DDCBackend {
     func setInputSource(
         _ source: DisplayInputSource,
         endpointIndex: Int,
-        protocolMode: InputSourceProtocolMode
+        protocolMode: InputSourceProtocolMode,
+        hint: DDCDisplayHint
     ) -> Bool {
-        setInputCalls.append((endpointIndex, source, protocolMode))
+        setInputCalls.append((endpointIndex, source, protocolMode, hint))
         return true
     }
 }
@@ -684,5 +687,250 @@ struct AudioManagerTests {
         #expect(manager.setDDCBrightness(-10, endpointIndex: 0) == true)
         #expect(ddc.setBrightnessCalls.last?.brightness == 0)
         #expect(manager.readDDCBrightness(endpointIndex: 0) == 0)
+    }
+
+    @Test("Apple Silicon 右屏 LG UltraFine 回归：即使 IOKit 端点无 LG 名称，仍通过 0x1E6D VendorID 识别 LG，且中屏切走导致 dispext 偏移时不丢配置")
+    func rightScreenLGUltraFineHintAndDynamicDispExtShiftResilience() {
+        let store = InMemoryStateStore()
+        let ddc = MockDDCBackend()
+
+        // 初始双外接屏同时在线：中屏在 dispext0 (index 0)，右屏在 dispext1 (index 1)，IOKit 均无品牌名
+        ddc.endpoints = [
+            DDCDisplayEndpoint(
+                index: 0,
+                name: "外接显示器 #1",
+                registryPath: "IOService:/.../dispext0:dcpav-service-epic:0/DCPAVServiceProxy"
+            ),
+            DDCDisplayEndpoint(
+                index: 1,
+                name: "外接显示器 #2",
+                registryPath: "IOService:/.../dispext1:dcpav-service-epic:0/DCPAVServiceProxy"
+            )
+        ]
+
+        let centerDisplay = DisplayInfo(
+            id: 3,
+            uuid: "E7ED1E57-B93B-4D73-9864-BCCD389B3D4D",
+            serialNumber: "508957",
+            numericSerial: 508957,
+            vendorID: 0x1E6D,
+            modelID: 0x5CBD,
+            displayPortToken: "dispext0",
+            name: "中屏",
+            systemName: "LG ULTRAFINE",
+            customName: "中屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: 0,
+            width: 1920,
+            height: 1080,
+            isMain: true
+        )
+        let rightDisplayOnExt1 = DisplayInfo(
+            id: 2,
+            uuid: "70AA4EEE-E3C1-4449-9DDD-E6346A6566D9",
+            serialNumber: "651685",
+            numericSerial: 651685,
+            vendorID: 0x1E6D,
+            modelID: 0x5C9D,
+            displayPortToken: "dispext1",
+            name: "右屏",
+            systemName: "LG ULTRAFINE",
+            customName: "右屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: 1920,
+            width: 1920,
+            height: 1080,
+            isMain: false
+        )
+
+        let manager = AudioManager(audioBackend: MockAudioBackend(), ddcBackend: ddc, softwareVolume: MockSoftwareVolumeBackend(), store: store)
+        manager.updateKnownDisplays([centerDisplay, rightDisplayOnExt1])
+
+        // 1. 切换右屏输入源 -> 必须命中 index 1，且将 hint.isLG == true (vendor 0x1E6D) 透传给 DDCBackend，不再误判为非 LG
+        #expect(manager.setDisplayInputSource(.hdmi2, endpointIndex: 1, protocolMode: .auto, displayUUID: rightDisplayOnExt1.uuid) == true)
+        #expect(ddc.setInputCalls.last?.index == 1)
+        #expect(ddc.setInputCalls.last?.source == .hdmi2)
+        #expect(ddc.setInputCalls.last?.mode == .auto)
+        #expect(ddc.setInputCalls.last?.hint.isLG == true)
+        #expect(ddc.setInputCalls.last?.hint.vendorID == 0x1E6D)
+
+        // 2. 为右屏设置独立协议覆盖（如强制 LG 0xF4）并为 USB-C 手动绑定 0xF4=0xD1
+        manager.setDisplayInputProtocol(.lgAlt, forDisplayUUID: rightDisplayOnExt1.uuid)
+        let manualUSBCCode = DDCInputCode(dataAddress: 0x50, vcpCode: 0xF4, value: 0xD1)
+        manager.setManualInputCode(manualUSBCCode, for: .usbC, endpointIndex: 1, displayUUID: rightDisplayOnExt1.uuid)
+
+        // 3. 模拟「中屏」切走到另一台主机后断开：右屏在 macOS 中自动漂移为 dispext0 (index 0)！
+        //    即便 UI 调用方仍传入旧的 endpointIndex = 1，通过 displayUUID 也应动态重定位到最新 index 0，且保留右屏专属协议与端口编码！
+        ddc.endpoints = [
+            DDCDisplayEndpoint(
+                index: 0,
+                name: "外接显示器 #1",
+                registryPath: "IOService:/.../dispext0:dcpav-service-epic:0/DCPAVServiceProxy"
+            )
+        ]
+        let rightDisplayShiftedToExt0 = DisplayInfo(
+            id: 2,
+            uuid: rightDisplayOnExt1.uuid,
+            serialNumber: "651685",
+            numericSerial: 651685,
+            vendorID: 0x1E6D,
+            modelID: 0x5C9D,
+            displayPortToken: "dispext0",
+            name: "右屏",
+            systemName: "LG ULTRAFINE",
+            customName: "右屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            originX: 1512,
+            width: 1920,
+            height: 1080,
+            isMain: false
+        )
+        manager.updateKnownDisplays([rightDisplayShiftedToExt0])
+
+        // 切右屏 DP1（未单独绑码，但该屏覆盖为 .lgAlt，即便全局传 .standard 也应走右屏专属 .lgAlt 且命中新 index 0）
+        #expect(manager.setDisplayInputSource(.displayPort1, endpointIndex: 1, protocolMode: .standard, displayUUID: rightDisplayShiftedToExt0.uuid) == true)
+        #expect(ddc.setInputCalls.last?.index == 0)
+        #expect(ddc.setInputCalls.last?.mode == .lgAlt)
+        #expect(ddc.setInputCalls.last?.hint.isLG == true)
+
+        // 切右屏 USB-C -> 应直接命中之前在 dispext1 时绑定的 0xF4=0xD1，并发往新 index 0
+        #expect(manager.setDisplayInputSource(.usbC, endpointIndex: 1, protocolMode: .auto, displayUUID: rightDisplayShiftedToExt0.uuid) == true)
+        #expect(ddc.writeRawInputCalls.last?.index == 0)
+        #expect(ddc.writeRawInputCalls.last?.code == manualUSBCCode)
+    }
+
+    @Test("跨场景零手操回归：实验室 DELL (dispext0) 拔线回家接双 LG (dispext0/1) 时，能力缓存、音量模式与输入源协议全自动隔离切换")
+    func labDellToHomeDualLGZeroTouchTransition() throws {
+        // 模拟历史遗留脏状态：两台 LG 音频同时指向旧索引 1，且右屏曾被手操绑在旧 port:dispext1
+        let dirtyInitial = PersistedAppState(
+            audioToDDCBindings: [
+                "1E6D9D5C-0000-0000-0A23-010380462878": 1,
+                "1E6DBD5C-0000-0000-0A24-0104B53C2278": 1
+            ],
+            displayToDDCBindings: [
+                "70AA4EEE-E3C1-4449-9DDD-E6346A6566D9": "port:dispext1"
+            ]
+        )
+        let store = InMemoryStateStore(initial: dirtyInitial)
+        let audio = MockAudioBackend()
+        let ddc = MockDDCBackend()
+        let softVol = MockSoftwareVolumeBackend()
+
+        let manager = AudioManager(audioBackend: audio, ddcBackend: ddc, softwareVolume: softVol, store: store)
+
+        // --- 阶段 1：在实验室接 DELL（USB-C 报为 0x19，不支持 0x62 音量，占用 dispext0） ---
+        let dellDisplay = DisplayInfo(
+            id: 2,
+            uuid: "30842DC4-3EFC-4D83-98E6-D8F59FFAA634",
+            vendorID: 0x10AC,
+            modelID: 0xA0E9,
+            displayPortToken: "dispext0",
+            name: "DELL U2718Q",
+            systemName: "DELL U2718Q",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            width: 3840,
+            height: 2160
+        )
+        let dellCaps = try #require(DDCCapabilities.parse(
+            capabilitiesString: "(prot(monitor)type(lcd)model(U2724DE)vcp(10 12 60(11 0F 19) D6))"
+        ))
+        #expect(dellCaps.supportedInputs == [.hdmi1, .displayPort1, .usbC])
+        #expect(dellCaps.supportedInputCodes == [.hdmi1: 0x11, .displayPort1: 0x0F, .usbC: 0x19])
+
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "外接显示器 #1", registryPath: "IOService:/.../dispext0/DCPAVServiceProxy")
+        ]
+        ddc.hardwareCapabilities = [0: dellCaps]
+        audio.devices = [
+            AudioOutputDevice(id: 50, uid: "10ACE9A0-0000", name: "DELL U2718Q", transport: .displayPort, isDefault: true, supportsCoreAudioVolume: false)
+        ]
+
+        manager.updateKnownDisplays([dellDisplay])
+        _ = manager.probeCapabilitiesAndBrightness(endpointIndex: 0, displayUUID: dellDisplay.uuid)
+
+        // 实验室 DELL 音量自动走免驱动软件音量，输入源自动携带非 LG 标记与精确 0x19 编码
+        #expect(manager.currentVolumeSnapshot().mode == .software(deviceName: "DELL U2718Q"))
+        #expect(manager.setDisplayInputSource(.usbC, endpointIndex: 0, protocolMode: .auto, displayUUID: dellDisplay.uuid) == true)
+        #expect(ddc.setInputCalls.last?.hint.isLG == false)
+        #expect(ddc.setInputCalls.last?.hint.isKnownNonLG == true)
+        #expect(ddc.setInputCalls.last?.hint.capabilities?.supportedInputCodes[.usbC] == 0x19)
+
+        // --- 阶段 2：合盖回家，MonitorBlock 常驻不重启，这次先插了「右屏」占用了同一个 dispext0，再插「中屏」占用 dispext1 ---
+        let homeRight = DisplayInfo(
+            id: 3,
+            uuid: "70AA4EEE-E3C1-4449-9DDD-E6346A6566D9",
+            serialNumber: "651685",
+            numericSerial: 651685,
+            vendorID: 0x1E6D,
+            modelID: 0x5C9D,
+            displayPortToken: "dispext0",
+            name: "右屏",
+            systemName: "LG ULTRAFINE",
+            customName: "右屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            width: 1920,
+            height: 1080
+        )
+        let homeCenter = DisplayInfo(
+            id: 4,
+            uuid: "E7ED1E57-B93B-4D73-9864-BCCD389B3D4D",
+            serialNumber: "508957",
+            numericSerial: 508957,
+            vendorID: 0x1E6D,
+            modelID: 0x5CBD,
+            displayPortToken: "dispext1",
+            name: "中屏",
+            systemName: "LG ULTRAFINE",
+            customName: "中屏",
+            isBuiltin: false,
+            isActive: true,
+            isOnline: true,
+            width: 1920,
+            height: 1080
+        )
+        ddc.endpoints = [
+            DDCDisplayEndpoint(index: 0, name: "外接显示器 #1", registryPath: "IOService:/.../dispext0/DCPAVServiceProxy"),
+            DDCDisplayEndpoint(index: 1, name: "外接显示器 #2", registryPath: "IOService:/.../dispext1/DCPAVServiceProxy")
+        ]
+        ddc.hardwareCapabilities = [
+            0: DDCCapabilities(isReachable: true, supportsBrightness: true, supportsVolume: true, supportedInputs: nil),
+            1: DDCCapabilities(isReachable: true, supportsBrightness: true, supportsVolume: true, supportedInputs: nil)
+        ]
+        ddc.hardwareVolumes = [0: 35, 1: 60]
+        audio.devices = [
+            AudioOutputDevice(id: 101, uid: "1E6D9D5C-0000-0000-0A23-010380462878", name: "LG ULTRAFINE", transport: .hdmi, isDefault: true, supportsCoreAudioVolume: false),
+            AudioOutputDevice(id: 86, uid: "1E6DBD5C-0000-0000-0A24-0104B53C2278", name: "LG ULTRAFINE", transport: .displayPort, isDefault: false, supportsCoreAudioVolume: false)
+        ]
+
+        manager.updateKnownDisplays([homeRight, homeCenter])
+        let homeMap = manager.matchAllDDCEndpoints(for: [homeRight, homeCenter], endpoints: ddc.endpoints)
+
+        // 即使历史残留了 "port:dispext1"，物理管线 dispext0 仍优先锁定 index 0（绝不错控到中屏！）
+        #expect(homeMap[homeRight.uuid] == 0)
+        #expect(homeMap[homeCenter.uuid] == 1)
+
+        // 右屏占用了实验室 DELL 刚用过的 dispext0，但能力探测绝不命中 DELL 缓存，音量自动切回右屏 DDC[0] (35%)
+        let rightCaps = manager.probeCapabilitiesAndBrightness(endpointIndex: 0, displayUUID: homeRight.uuid)
+        #expect(rightCaps.supportsVolume == true)
+        #expect(rightCaps.supportedInputs == nil)
+
+        let homeVol = manager.currentVolumeSnapshot(readHardwareDDC: true)
+        #expect(homeVol.mode == .ddc(ddcIndex: 0, displayName: "外接显示器 #1"))
+        #expect(abs(homeVol.volume - 0.35) < 0.001)
+
+        // 切右屏输入源 -> 自动识别 LG (0x1E6D) 并发往 index 0
+        #expect(manager.setDisplayInputSource(.hdmi2, endpointIndex: 0, protocolMode: .auto, displayUUID: homeRight.uuid) == true)
+        #expect(ddc.setInputCalls.last?.index == 0)
+        #expect(ddc.setInputCalls.last?.hint.isLG == true)
     }
 }
