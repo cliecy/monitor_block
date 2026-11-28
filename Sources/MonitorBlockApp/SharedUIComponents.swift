@@ -467,7 +467,11 @@ struct DisplayControlCard: View {
                                 PillTag(text: "规则", color: .indigo)
                             }
                             if !display.isBuiltin, ddcIndex != nil, caps?.isReachable == false {
-                                PillTag(text: "无 DDC/CI", color: .secondary)
+                                if caps?.blockedByAdapterOrLink == true {
+                                    PillTag(text: "转接头拦截 DDC", color: .orange)
+                                } else {
+                                    PillTag(text: "无 DDC/CI", color: .secondary)
+                                }
                             }
                         }
 
@@ -521,7 +525,28 @@ struct DisplayControlCard: View {
                     DisplayModeSegmentedControl(display: display, viewModel: viewModel)
 
                     // External Hardware Brightness (VCP 0x10) & Input Source Strip (for reachable DDC monitors)
-                    if let idx = ddcIndex, caps?.isReachable != false {
+                    if ddcIndex != nil, caps?.isReachable == false, caps?.blockedByAdapterOrLink == true {
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: "cable.connector.slash")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(.orange)
+                            Text("当前 USB-C 转 HDMI 转换芯片拒绝了 DDC 指令（0xE0114000）。改用 USB-C / DP 直连线或重插转接头可恢复硬件控制。")
+                                .font(.system(size: 10.5))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                            Button("重试") {
+                                viewModel.probeDDCStateAsync(forceCapabilities: true)
+                            }
+                            .font(.system(size: 10.5, weight: .medium))
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.orange.opacity(0.09))
+                        .cornerRadius(7)
+                    } else if let idx = ddcIndex, caps?.isReachable != false {
                         if caps == nil || caps?.supportsBrightness == true {
                             let bright = viewModel.ddcBrightness[idx] ?? 0.5
                             HStack(spacing: 8) {

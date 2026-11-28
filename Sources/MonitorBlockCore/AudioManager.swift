@@ -542,7 +542,8 @@ public final class AudioManager: @unchecked Sendable {
         lock.unlock()
 
         let caps: DDCCapabilities
-        if !force, let existing {
+        // 仅当之前探测结果为可达（isReachable == true）时复用缓存；若之前因唤醒握手或转接头暂忙返回了不可达，下次自动重试硬件探测
+        if !force, let existing, existing.isReachable {
             caps = existing
         } else {
             caps = ddcBackend.probeCapabilities(endpointIndex: ctx.resolvedIndex)

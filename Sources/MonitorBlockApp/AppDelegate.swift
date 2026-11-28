@@ -83,7 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         displayManager.startObservingReconfiguration { [weak self] in
             Task { @MainActor in
-                self?.scheduleRefresh(delay: 0.55, checkSafetyFallback: true, reprobeDDC: true)
+                // 留足 1.1s 等待 HDMI / HDCP / 转接头链路握手完成后再探测 DDC，防止过早读写触发 0xE0114000
+                self?.scheduleRefresh(delay: 1.1, checkSafetyFallback: true, reprobeDDC: true)
             }
         }
 
@@ -99,7 +100,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.scheduleRefresh(delay: 0.75, checkSafetyFallback: true, reprobeDDC: true)
+                self?.scheduleRefresh(delay: 1.3, checkSafetyFallback: true, reprobeDDC: true)
             }
         }
     }

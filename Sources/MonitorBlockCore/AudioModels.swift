@@ -71,6 +71,8 @@ public struct AudioOutputDevice: Equatable, Identifiable, Sendable {
 /// 从显示器 MCCS Capabilities (0xF3) 或实时探测得到的硬件能力描述
 public struct DDCCapabilities: Equatable, Sendable {
     public let isReachable: Bool
+    /// 当 macOS DCP 驱动或 USB-C 转 HDMI 转换芯片（如 cHDMIb）在内核层直接拒绝 I2C 写入（0xE0114000）时为 true
+    public let blockedByAdapterOrLink: Bool
     public let supportsBrightness: Bool
     public let supportsVolume: Bool
     /// 解析出的真实物理输入口；nil 表示未返回 0xF3 或未能解析，UI 回退展示全部常用输入源
@@ -81,6 +83,7 @@ public struct DDCCapabilities: Equatable, Sendable {
 
     public init(
         isReachable: Bool,
+        blockedByAdapterOrLink: Bool = false,
         supportsBrightness: Bool,
         supportsVolume: Bool,
         supportedInputs: [DisplayInputSource]? = nil,
@@ -88,6 +91,7 @@ public struct DDCCapabilities: Equatable, Sendable {
         rawCapabilitiesString: String? = nil
     ) {
         self.isReachable = isReachable
+        self.blockedByAdapterOrLink = blockedByAdapterOrLink
         self.supportsBrightness = supportsBrightness
         self.supportsVolume = supportsVolume
         self.supportedInputs = supportedInputs
@@ -97,6 +101,16 @@ public struct DDCCapabilities: Equatable, Sendable {
 
     public static let unreachable = DDCCapabilities(
         isReachable: false,
+        blockedByAdapterOrLink: false,
+        supportsBrightness: false,
+        supportsVolume: false,
+        supportedInputs: [],
+        rawCapabilitiesString: nil
+    )
+
+    public static let adapterBlocked = DDCCapabilities(
+        isReachable: false,
+        blockedByAdapterOrLink: true,
         supportsBrightness: false,
         supportsVolume: false,
         supportedInputs: [],

@@ -70,6 +70,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     private let createWithService: IOAVServiceCreateWithServiceFunc?
     private let writeI2C: IOAVServiceWriteI2CFunc?
     private let readI2C: IOAVServiceReadI2CFunc?
+    private let i2cLock = NSLock()
     private var handles: [UnsafeMutableRawPointer] = []
 
     public var isAvailable: Bool {
@@ -123,16 +124,30 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func probeCapabilities(endpointIndex: Int) -> DDCCapabilities {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
+
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else {
             return .unreachable
         }
         let service = services[endpointIndex].service
 
-        // 第 1 步：快速测试 I2C 是否可达（读亮度 0x10，失败再读音量 0x62），避免对 EIZO 等无 I2C 屏空等 24 次超时
-        let brightnessProbe = readVCPPercentage(code: Self.vcpBrightness, service: service)
-        let volumeProbe = (brightnessProbe == nil) ? readVCPPercentage(code: Self.vcpAudioVolume, service: service) : nil
+        // 第 1 步：快速测试 I2C 是否可达（读亮度 0x10，首次若遇转接头刚唤醒暂忙则间隔 80ms 重试一次，再测音量 0x62）
+        var lastWriteStatus: IOReturn = kIOReturnSuccess
+        var brightnessProbe = readVCPPercentage(code: Self.vcpBrightness, service: service, outWriteStatus: &lastWriteStatus)
+        if brightnessProbe == nil {
+            usleep(80_000)
+            brightnessProbe = readVCPPercentage(code: Self.vcpBrightness, service: service, outWriteStatus: &lastWriteStatus)
+        }
+        let volumeProbe = (brightnessProbe == nil)
+            ? readVCPPercentage(code: Self.vcpAudioVolume, service: service, outWriteStatus: &lastWriteStatus)
+            : nil
+
         guard brightnessProbe != nil || volumeProbe != nil else {
+            if lastWriteStatus != kIOReturnSuccess {
+                return .adapterBlocked
+            }
             return .unreachable
         }
 
@@ -154,12 +169,16 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func readBrightness(endpointIndex: Int) -> Int? {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return nil }
         return readVCPPercentage(code: Self.vcpBrightness, service: services[endpointIndex].service)
     }
 
     public func setBrightness(_ brightness: Int, endpointIndex: Int) -> Bool {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let clamped = UInt16(min(max(brightness, 0), 100))
         return writeVCP(
             code: Self.vcpBrightness,
@@ -170,12 +189,18 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func readVolume(endpointIndex: Int) -> Int? {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return nil }
         return readVCPPercentage(code: Self.vcpAudioVolume, service: services[endpointIndex].service)
     }
 
-    private func readVCPPercentage(code: UInt8, service: CFTypeRef) -> Int? {
+    private func readVCPPercentage(
+        code: UInt8,
+        service: CFTypeRef,
+        outWriteStatus: UnsafeMutablePointer<IOReturn>? = nil
+    ) -> Int? {
         guard let writeI2C, let readI2C else { return nil }
 
         let checksum: UInt8 = 0x6E ^ 0x51 ^ 0x82 ^ 0x01 ^ code
@@ -185,6 +210,7 @@ public final class AppleSiliconDDCBackend: DDCBackend {
             guard let ptr = buf.baseAddress else { return kIOReturnBadArgument }
             return writeI2C(service, Self.chipAddress, Self.dataAddressStandard, ptr, UInt32(buf.count))
         }
+        outWriteStatus?.pointee = writeStatus
         guard writeStatus == kIOReturnSuccess else { return nil }
 
         usleep(40_000)
@@ -242,6 +268,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func setVolume(_ volume: Int, endpointIndex: Int) -> Bool {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let clamped = UInt16(min(max(volume, 0), 100))
         return writeVCP(
             code: Self.vcpAudioVolume,
@@ -252,6 +280,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func setMuted(_ muted: Bool, endpointIndex: Int) -> Bool {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         // MCCS VCP 0x8D: 1 = Mute, 2 = Unmute
         let value: UInt16 = muted ? 1 : 2
         return writeVCP(
@@ -263,6 +293,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func readInputSource(endpointIndex: Int, hint: DDCDisplayHint = DDCDisplayHint()) -> DDCInputReadResult {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else {
             return DDCInputReadResult()
@@ -295,6 +327,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
     }
 
     public func writeRawInputCode(_ code: DDCInputCode, endpointIndex: Int) -> Bool {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return false }
         return writeVCP(
@@ -311,6 +345,8 @@ public final class AppleSiliconDDCBackend: DDCBackend {
         protocolMode: InputSourceProtocolMode = .auto,
         hint: DDCDisplayHint = DDCDisplayHint()
     ) -> Bool {
+        i2cLock.lock()
+        defer { i2cLock.unlock() }
         let services = discoverExternalAVServices()
         guard services.indices.contains(endpointIndex) else { return false }
         let target = services[endpointIndex]
